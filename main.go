@@ -63,9 +63,9 @@ func initialModel() model {
 		state:  stateMenu,
 		cursor: 0,
 		menuChoices: []string{
-			"Food (Tracking, Recipes & Shopping)",
-			"Subscriptions (Payments & Dates)",
-			"Academics (Scraped Assignments)",
+			"🛒 Food (Tracking, Recipes & Shopping)",
+			"💳 Subscriptions (Payments & Dates)",
+			"📚 Academics (Scraped Assignments)",
 		},
 		foodItems: []FoodItem{
 			{Name: "Onions", Price: 1.50, Amount: 2, Selected: false},
@@ -73,16 +73,16 @@ func initialModel() model {
 			{Name: "Chicken Breast", Price: 5.50, Amount: 1, Selected: false},
 		},
 		buyChoices: []string{
-			"Delivery (+$3.00)",
-			"Pick Up (Free)",
+			"🚚 Delivery (+$3.00)",
+			"🏪 Pick Up (Free)",
 		},
 		subItems: []SubItem{
 			{Name: "Netflix", Price: 15.99, DueDate: "Mar 05, 2026"},
 			{Name: "Spotify", Price: 10.99, DueDate: "Mar 12, 2026"},
 		},
 		studyItems: []StudyItem{
-			{Name: "[High] Math: Final Exam", DueDate: "Due in 2 days"},
-			{Name: "[Med] History: Essay", DueDate: "Due in 5 days"},
+			{Name: "🔴 Math: Final Exam", DueDate: "Due in 2 days"},
+			{Name: "🟡 History: Essay", DueDate: "Due in 5 days"},
 		},
 	}
 }
@@ -301,13 +301,12 @@ func (m *model) goBack() {
 }
 
 // --- STYLES ---
-// Removed PaddingLeft from all styles so we can manually control spaces!
 var (
 	titleStyle = lipgloss.NewStyle().MarginBottom(1).Padding(0, 1).Foreground(lipgloss.Color("#FFF")).Background(lipgloss.Color("#7D56F4")).Bold(true)
 	itemStyle  = lipgloss.NewStyle()
 	selStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Bold(true)
 	checkStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#EE6FF8")).Bold(true)
-	hintStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#767676")) // Margin Top removed, handled via string \n
+	hintStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#767676"))
 	boxStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1, 2).BorderForeground(lipgloss.Color("#7D56F4"))
 )
 
@@ -316,33 +315,32 @@ func (m model) View() string {
 	var s string
 
 	if m.state == stateAddFood || m.state == stateAddSub {
-		s += titleStyle.Render("ADD NEW ITEM") + "\n\n"
+		s += titleStyle.Render("➕ ADD NEW ITEM") + "\n\n"
 		for i := range m.inputs {
 			s += m.inputs[i].View()
 			if i < len(m.inputs)-1 {
 				s += "\n"
 			}
 		}
-		// Newlines pulled OUTSIDE the render function
 		s += "\n\n" + hintStyle.Render("[Tab/Up/Down: Next Field • Enter: Save • Esc: Cancel]")
 		return lipgloss.NewStyle().Margin(1, 2).Render(s)
 	}
 
 	switch m.state {
 	case stateMenu:
-		s += titleStyle.Render("PERSONAL DASHBOARD") + "\n"
+		s += titleStyle.Render("⚡ PERSONAL DASHBOARD") + "\n"
 		s += renderList(m.menuChoices, m.cursor)
 		s += "\n" + hintStyle.Render("[up/down: Navigate • Enter: Select • q: Quit]")
 
 	case stateFood:
-		s += titleStyle.Render("FOOD - Inventory") + "\n"
+		s += titleStyle.Render("🛒 FOOD - Inventory") + "\n"
 		if len(m.foodItems) == 0 {
 			s += "    No items. Press 'a' to add one.\n"
 		} else {
 			for i, item := range m.foodItems {
 				cursor := "  "
 				if m.cursor == i {
-					cursor = "> "
+					cursor = "▶ "
 				}
 
 				check := "[ ]"
@@ -350,8 +348,9 @@ func (m model) View() string {
 					check = checkStyle.Render("[x]")
 				}
 
-				// Added manual spaces "  %s" at the beginning for perfect padding
-				line := fmt.Sprintf("  %s %s %-18s (x%d)  -  $%.2f", cursor, check, item.Name, item.Amount, item.Price)
+				// Using Lipgloss to calculate width safely
+				nameCol := lipgloss.NewStyle().Width(18).Render(item.Name)
+				line := fmt.Sprintf("  %s %s %s (x%d)  -  $%.2f", cursor, check, nameCol, item.Amount, item.Price)
 
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
@@ -363,7 +362,7 @@ func (m model) View() string {
 		s += "\n" + hintStyle.Render("[a: Add • Space: Select • r: Recipe • c: Checkout • Esc: Back]")
 
 	case stateFoodRecipe:
-		s += titleStyle.Render("GENERATED RECIPE") + "\n"
+		s += titleStyle.Render("🍳 GENERATED RECIPE") + "\n"
 		var ingredients []string
 		for _, item := range m.foodItems {
 			if item.Selected {
@@ -372,15 +371,15 @@ func (m model) View() string {
 		}
 
 		if len(ingredients) == 0 {
-			s += boxStyle.Render("[!] You haven't selected any food items.\nGo back and select ingredients with [Space].")
+			s += boxStyle.Render("❌ You haven't selected any food items.\nGo back and select ingredients with [Space].")
 		} else {
-			content := fmt.Sprintf("Selected ingredients:\n- %s\n\nTip:\nMix everything in a pan with olive oil,\nsalt, and pepper. A quick and nutritious stir-fry!", strings.Join(ingredients, "\n- "))
+			content := fmt.Sprintf("Selected ingredients:\n- %s\n\n💡 Tip:\nMix everything in a pan with olive oil,\nsalt, and pepper. A quick and nutritious stir-fry!", strings.Join(ingredients, "\n- "))
 			s += boxStyle.Render(content)
 		}
 		s += "\n" + hintStyle.Render("[Esc: Back to Food]")
 
 	case stateFoodBuy:
-		s += titleStyle.Render("CHECKOUT") + "\n"
+		s += titleStyle.Render("🚚 CHECKOUT") + "\n"
 		var total float64
 		var count int
 		for _, item := range m.foodItems {
@@ -391,13 +390,13 @@ func (m model) View() string {
 		}
 
 		if count == 0 {
-			s += boxStyle.Render("No items in the cart.\nGo back and select items with [Space].")
+			s += boxStyle.Render("🛒 No items in the cart.\nGo back and select items with [Space].")
 		} else {
 			s += fmt.Sprintf("Selected unique items: %d\nSubtotal: $%.2f\n\nChoose delivery method:\n\n", count, total)
 			for i, choice := range m.buyChoices {
 				cursor := "  "
 				if m.cursor == i {
-					cursor = "> "
+					cursor = "▶ "
 				}
 
 				line := fmt.Sprintf("  %s %s", cursor, choice)
@@ -412,7 +411,7 @@ func (m model) View() string {
 			if m.cursor == 0 {
 				shipping = 3.00
 			}
-			s += fmt.Sprintf("\nTOTAL TO PAY: $%.2f\n", total+shipping)
+			s += fmt.Sprintf("\n💰 TOTAL TO PAY: $%.2f\n", total+shipping)
 		}
 
 		if count > 0 {
@@ -422,17 +421,19 @@ func (m model) View() string {
 		}
 
 	case stateSubs:
-		s += titleStyle.Render("SUBSCRIPTIONS") + "\n"
+		s += titleStyle.Render("💳 SUBSCRIPTIONS") + "\n"
 		if len(m.subItems) == 0 {
 			s += "    No items.\n"
 		} else {
 			for i, item := range m.subItems {
 				cursor := "  "
 				if m.cursor == i {
-					cursor = "> "
+					cursor = "▶ "
 				}
 
-				line := fmt.Sprintf("  %s %-15s | $%.2f | Due: %s", cursor, item.Name, item.Price, item.DueDate)
+				// Using Lipgloss to calculate width safely
+				nameCol := lipgloss.NewStyle().Width(15).Render(item.Name)
+				line := fmt.Sprintf("  %s %s | $%.2f | Due: %s", cursor, nameCol, item.Price, item.DueDate)
 
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
@@ -444,8 +445,7 @@ func (m model) View() string {
 		s += "\n" + hintStyle.Render("[a: Add • up/down: Navigate • Esc: Back]")
 
 	case stateStudy:
-		s += titleStyle.Render("ACADEMICS (Automated Scraper)") + "\n"
-		// The bug was here! Pulled \n\n outside of the Render call.
+		s += titleStyle.Render("📚 ACADEMICS (Automated Scraper)") + "\n"
 		s += lipgloss.NewStyle().Foreground(lipgloss.Color("#FAFAFA")).Render("Status: Synced with university portal") + "\n\n"
 
 		if len(m.studyItems) == 0 {
@@ -454,10 +454,12 @@ func (m model) View() string {
 			for i, item := range m.studyItems {
 				cursor := "  "
 				if m.cursor == i {
-					cursor = "> "
+					cursor = "▶ "
 				}
 
-				line := fmt.Sprintf("  %s %-25s | %s", cursor, item.Name, item.DueDate)
+				// THIS is the magic line that saves the alignment for emojis!
+				nameCol := lipgloss.NewStyle().Width(25).Render(item.Name)
+				line := fmt.Sprintf("  %s %s | %s", cursor, nameCol, item.DueDate)
 
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
@@ -476,7 +478,7 @@ func renderList(items []string, cursor int) string {
 	var s string
 	for i, item := range items {
 		if cursor == i {
-			s += selStyle.Render("  > "+item) + "\n"
+			s += selStyle.Render("  ▶ "+item) + "\n"
 		} else {
 			s += itemStyle.Render("    "+item) + "\n"
 		}
