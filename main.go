@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"strconv"
@@ -50,6 +51,7 @@ type model struct {
 	cursor     int
 	inputs     []textinput.Model
 	focusIndex int
+	token      string
 
 	menuChoices []string
 	foodItems   []FoodItem
@@ -58,33 +60,63 @@ type model struct {
 	studyItems  []StudyItem
 }
 
-func initialModel() model {
-	return model{
+// initialModel now acts like a mock database using the token
+func initialModel(token string) model {
+	m := model{
 		state:  stateMenu,
 		cursor: 0,
+		token:  token,
 		menuChoices: []string{
 			"🛒 Food (Tracking, Recipes & Shopping)",
 			"💳 Subscriptions (Payments & Dates)",
 			"📚 Academics (Scraped Assignments)",
 		},
-		foodItems: []FoodItem{
-			{Name: "Onions", Price: 1.50, Amount: 2, Selected: false},
-			{Name: "Tomatoes", Price: 2.00, Amount: 3, Selected: false},
-			{Name: "Chicken Breast", Price: 5.50, Amount: 1, Selected: false},
-		},
 		buyChoices: []string{
 			"🚚 Delivery (+$3.00)",
 			"🏪 Pick Up (Free)",
 		},
-		subItems: []SubItem{
-			{Name: "Netflix", Price: 15.99, DueDate: "Mar 05, 2026"},
-			{Name: "Spotify", Price: 10.99, DueDate: "Mar 12, 2026"},
-		},
-		studyItems: []StudyItem{
-			{Name: "🔴 Math: Final Exam", DueDate: "Due in 2 days"},
-			{Name: "🟡 History: Essay", DueDate: "Due in 5 days"},
-		},
 	}
+
+	// Mock Backend: Load different data based on the token
+	switch token {
+	case "user1":
+		m.foodItems = []FoodItem{
+			{Name: "Apples", Price: 2.50, Amount: 5, Selected: false},
+			{Name: "Oatmeal", Price: 3.00, Amount: 1, Selected: false},
+			{Name: "Almond Milk", Price: 4.50, Amount: 2, Selected: false},
+		}
+		m.subItems = []SubItem{
+			{Name: "Gym", Price: 30.00, DueDate: "Mar 01, 2026"},
+			{Name: "Spotify", Price: 10.99, DueDate: "Mar 15, 2026"},
+		}
+		m.studyItems = []StudyItem{
+			{Name: "🟢 Biology: Lab Report", DueDate: "Due in 1 day"},
+			{Name: "🟡 English: Reading", DueDate: "Due in 3 days"},
+		}
+
+	case "user2":
+		m.foodItems = []FoodItem{
+			{Name: "Steak", Price: 12.00, Amount: 2, Selected: false},
+			{Name: "Potatoes", Price: 3.50, Amount: 1, Selected: false},
+			{Name: "Eggs (Dozen)", Price: 4.00, Amount: 1, Selected: false},
+		}
+		m.subItems = []SubItem{
+			{Name: "Netflix", Price: 15.99, DueDate: "Apr 05, 2026"},
+			{Name: "Amazon Prime", Price: 14.99, DueDate: "Apr 12, 2026"},
+		}
+		m.studyItems = []StudyItem{
+			{Name: "🔴 Math: Calculus Exam", DueDate: "Due in 10 days"},
+			{Name: "🔴 Physics: Project", DueDate: "Due in 12 days"},
+		}
+
+	default:
+		// Unknown user gets empty lists
+		m.foodItems = []FoodItem{}
+		m.subItems = []SubItem{}
+		m.studyItems = []StudyItem{}
+	}
+
+	return m
 }
 
 func (m *model) initForm(state sessionState) {
@@ -329,6 +361,8 @@ func (m model) View() string {
 	switch m.state {
 	case stateMenu:
 		s += titleStyle.Render("⚡ PERSONAL DASHBOARD") + "\n"
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(fmt.Sprintf("🔑 Authenticated as: %s", m.token)) + "\n\n"
+
 		s += renderList(m.menuChoices, m.cursor)
 		s += "\n" + hintStyle.Render("[up/down: Navigate • Enter: Select • q: Quit]")
 
@@ -348,7 +382,6 @@ func (m model) View() string {
 					check = checkStyle.Render("[x]")
 				}
 
-				// Using Lipgloss to calculate width safely
 				nameCol := lipgloss.NewStyle().Width(18).Render(item.Name)
 				line := fmt.Sprintf("  %s %s %s (x%d)  -  $%.2f", cursor, check, nameCol, item.Amount, item.Price)
 
@@ -431,7 +464,6 @@ func (m model) View() string {
 					cursor = "▶ "
 				}
 
-				// Using Lipgloss to calculate width safely
 				nameCol := lipgloss.NewStyle().Width(15).Render(item.Name)
 				line := fmt.Sprintf("  %s %s | $%.2f | Due: %s", cursor, nameCol, item.Price, item.DueDate)
 
@@ -457,7 +489,6 @@ func (m model) View() string {
 					cursor = "▶ "
 				}
 
-				// THIS is the magic line that saves the alignment for emojis!
 				nameCol := lipgloss.NewStyle().Width(25).Render(item.Name)
 				line := fmt.Sprintf("  %s %s | %s", cursor, nameCol, item.DueDate)
 
@@ -487,7 +518,17 @@ func renderList(items []string, cursor int) string {
 }
 
 func main() {
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	tokenPtr := flag.String("token", "", "User authentication token (Mandatory)")
+	flag.Parse()
+
+	// 1. Validate that the token is present
+	if *tokenPtr == "" {
+		fmt.Println("❌ Error: The --token flag is mandatory.")
+		fmt.Println("Usage: go run main.go --token=user1")
+		os.Exit(1)
+	}
+
+	p := tea.NewProgram(initialModel(*tokenPtr), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error starting TUI: %v\n", err)
 		os.Exit(1)
