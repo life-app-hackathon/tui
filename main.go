@@ -56,7 +56,6 @@ type model struct {
 	editIndex  int
 	token      string
 
-	// Radio button states for Subscriptions
 	subCycleChoices []string
 	subCycleChoice  int
 
@@ -74,7 +73,6 @@ func initialModel(token string) model {
 		editIndex: -1,
 		token:     token,
 
-		// Initialize the radio button options
 		subCycleChoices: []string{"Monthly", "3 Months", "Yearly"},
 		subCycleChoice:  0,
 
@@ -133,7 +131,6 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 	m.focusIndex = 0
 
 	if state == stateAddFood {
-		// Food uses 4 text inputs
 		m.inputs = make([]textinput.Model, 4)
 		for i := range m.inputs {
 			t := textinput.New()
@@ -160,7 +157,6 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 		}
 
 	} else if state == stateAddSub {
-		// Subs uses 3 text inputs + 1 custom radio button row
 		m.inputs = make([]textinput.Model, 3)
 		for i := range m.inputs {
 			t := textinput.New()
@@ -177,7 +173,7 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 		m.inputs[1].Placeholder = "Price (e.g., 15.99)"
 		m.inputs[2].Placeholder = "Payment Date (e.g., Apr 01, 2026)"
 
-		m.subCycleChoice = 0 // Default to Monthly
+		m.subCycleChoice = 0
 
 		if isEdit && m.editIndex >= 0 {
 			item := m.subItems[m.editIndex]
@@ -185,7 +181,6 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 			m.inputs[1].SetValue(fmt.Sprintf("%.2f", item.Price))
 			m.inputs[2].SetValue(item.DueDate)
 
-			// Match the cycle to our radio button choices
 			for i, c := range m.subCycleChoices {
 				if c == item.Cycle {
 					m.subCycleChoice = i
@@ -208,14 +203,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
-		// --- FORM HANDLING ---
 		if m.state == stateAddFood || m.state == stateAddSub {
 			switch msg.String() {
 			case "esc":
 				m.goBack()
 				return m, nil
 
-			// Catch left/right specifically for the radio buttons
 			case "left", "right":
 				if m.state == stateAddSub && m.focusIndex == 3 {
 					if msg.String() == "left" && m.subCycleChoice > 0 {
@@ -223,15 +216,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else if msg.String() == "right" && m.subCycleChoice < len(m.subCycleChoices)-1 {
 						m.subCycleChoice++
 					}
-					return m, nil // Don't pass arrow keys to text input
+					return m, nil
 				}
 
 			case "tab", "shift+tab", "enter", "up", "down":
 				s := msg.String()
+				totalFields := 4
 
-				totalFields := 4 // Both forms have 4 logical fields (Inputs + Radios)
-
-				// If we hit enter on the LAST field, save the form!
 				if s == "enter" && m.focusIndex == totalFields-1 {
 					m.saveForm()
 					m.goBack()
@@ -244,14 +235,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.focusIndex++
 				}
 
-				// Wrap around
 				if m.focusIndex > totalFields-1 {
 					m.focusIndex = 0
 				} else if m.focusIndex < 0 {
 					m.focusIndex = totalFields - 1
 				}
 
-				// Apply focus styles visually
 				cmds := make([]tea.Cmd, len(m.inputs))
 				for i := 0; i < len(m.inputs); i++ {
 					if i == m.focusIndex {
@@ -331,6 +320,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.initForm(stateAddSub, true)
 			}
 
+		case "d": // Delete
+			if m.state == stateFood && len(m.foodItems) > 0 {
+				// Remove the item using standard Go slice syntax
+				m.foodItems = append(m.foodItems[:m.cursor], m.foodItems[m.cursor+1:]...)
+
+				// Fix the cursor if we deleted the very last item
+				if m.cursor >= len(m.foodItems) && len(m.foodItems) > 0 {
+					m.cursor = len(m.foodItems) - 1
+				} else if len(m.foodItems) == 0 {
+					m.cursor = 0
+				}
+			} else if m.state == stateSubs && len(m.subItems) > 0 {
+				m.subItems = append(m.subItems[:m.cursor], m.subItems[m.cursor+1:]...)
+
+				if m.cursor >= len(m.subItems) && len(m.subItems) > 0 {
+					m.cursor = len(m.subItems) - 1
+				} else if len(m.subItems) == 0 {
+					m.cursor = 0
+				}
+			}
+
 		case " ":
 			if m.state == stateFood && len(m.foodItems) > 0 {
 				m.foodItems[m.cursor].Selected = !m.foodItems[m.cursor].Selected
@@ -408,7 +418,6 @@ func (m *model) saveForm() {
 			date = "TBD"
 		}
 
-		// Pull the value from our radio button state instead of a text input!
 		cycle := m.subCycleChoices[m.subCycleChoice]
 
 		newItem := SubItem{Name: name, Price: price, DueDate: date, Cycle: cycle}
@@ -453,12 +462,10 @@ func (m model) View() string {
 			s += titleStyle.Render("➕ ADD NEW ITEM") + "\n\n"
 		}
 
-		// Render normal text inputs
 		for i := range m.inputs {
 			s += m.inputs[i].View() + "\n"
 		}
 
-		// Render custom Radio Buttons if we are in Subscriptions
 		if m.state == stateAddSub {
 			radioPrompt := "  Cycle:"
 			if m.focusIndex == 3 {
@@ -525,7 +532,7 @@ func (m model) View() string {
 				}
 			}
 		}
-		s += "\n" + hintStyle.Render("[a: Add • e: Edit • Space: Select • r: Recipe • c: Checkout • Esc: Back]")
+		s += "\n" + hintStyle.Render("[a: Add • e: Edit • d: Delete • Space: Select • r: Recipe • c: Checkout • Esc: Back]")
 
 	case stateFoodRecipe:
 		s += titleStyle.Render("🍳 GENERATED RECIPE") + "\n"
@@ -609,7 +616,7 @@ func (m model) View() string {
 				}
 			}
 		}
-		s += "\n" + hintStyle.Render("[a: Add • e: Edit • up/down: Navigate • Esc: Back]")
+		s += "\n" + hintStyle.Render("[a: Add • e: Edit • d: Delete • up/down: Navigate • Esc: Back]")
 
 	case stateStudy:
 		s += titleStyle.Render("📚 ACADEMICS (Automated Scraper)") + "\n"
