@@ -29,6 +29,7 @@ const (
 	stateProcessingBuy
 	stateSubs
 	stateStudy
+	stateScrapingCanvas // NEW: Scraping loading state
 	stateAddFood
 	stateAddSub
 )
@@ -37,9 +38,9 @@ const (
 type FoodItem struct {
 	Name           string  `json:"name"`
 	Price          float64 `json:"price"`
-	Amount         int     `json:"amount"` // Current Stock in Inventory
+	Amount         int     `json:"amount"`
 	RenewThreshold int     `json:"renewThreshold"`
-	CartQty        int     `json:"-"` // How many we want to BUY right now (Local state only)
+	CartQty        int     `json:"-"`
 }
 
 type SubItem struct {
@@ -66,6 +67,7 @@ type dataFetchedMsg []CategoryResponse
 type syncSuccessMsg struct{}
 type recipeGeneratedMsg string
 type buyCompleteMsg struct{}
+type canvasScrapedMsg []StudyItem // NEW: Message to handle scraped data
 type errMsg struct{ err error }
 
 // --- MAIN MODEL ---
@@ -88,7 +90,6 @@ type model struct {
 	subItems    []SubItem
 	studyItems  []StudyItem
 
-	// Recipe Generation State
 	generatedRecipe string
 	isGenerating    bool
 }
@@ -196,8 +197,27 @@ func generateRecipeCmd(ingredients []string) tea.Cmd {
 
 func processBuyCmd() tea.Cmd {
 	return func() tea.Msg {
-		time.Sleep(1500 * time.Millisecond) // Simulate payment gateway delay
+		time.Sleep(1500 * time.Millisecond)
 		return buyCompleteMsg{}
+	}
+}
+
+// NEW: Command to scrape canvas
+func scrapeCanvasCmd(token string) tea.Cmd {
+	return func() tea.Msg {
+		// Notice we added ?user_id= to the URL
+		resp, err := http.Post(baseURL+"/scrapers/canvas?user_id="+token, "application/json", nil)
+		if err != nil {
+			return errMsg{err}
+		}
+		defer resp.Body.Close()
+
+		var result map[string][]StudyItem
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return errMsg{err}
+		}
+
+		return canvasScrapedMsg(result["items"])
 	}
 }
 
@@ -288,9 +308,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case syncSuccessMsg:
-		// If we successfully synced, clear the status so it doesn't linger forever
-		// unless we specifically set it to something else (like after a purchase).
-		if m.statusMsg == "Syncing..." || m.statusMsg == "Syncing deletion..." {
+		if m.statusMsg == "Syncing..." || m.statusMsg == "Syncing deletion..." || m.statusMsg == "Syncing Canvas data..." {
 			m.statusMsg = "Saved securely to database ✓"
 		}
 		return m, fetchCategoriesCmd(m.token)
@@ -301,18 +319,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case buyCompleteMsg:
-		// 1. ADD BOUGHT ITEMS TO STOCK AND RESET CART
 		for i := range m.foodItems {
 			if m.foodItems[i].CartQty > 0 {
-				m.foodItems[i].Amount += m.foodItems[i].CartQty // Increase stock!
-				m.foodItems[i].CartQty = 0                      // Reset cart
+				m.foodItems[i].Amount += m.foodItems[i].CartQty
+				m.foodItems[i].CartQty = 0
 			}
 		}
 		m.state = stateFood
 		m.cursor = 0
 		m.statusMsg = "Order placed! Stock updated in database 🚚"
-		// 2. FIRE SYNC EVENT TO SAVE NEW STOCK LEVELS TO DATABASE
 		return m, syncCategoryCmd(m.token, "Food", m.catIDs["Food"], m.foodItems)
+
+	// NEW: Handle Canvas scraping completion
+	// Replace your old case canvasScrapedMsg with this:
+	case canvasScrapedMsg:
+		m.studyItems = msg
+		m.state = stateStudy
+		m.cursor = 0
+		m.statusMsg = "Canvas sync complete! ✅"
+
+		// Instead of syncing to the database (the backend did that for us),
+		// we just fetch categories to grab the new Database ID!
+		return m, fetchCategoriesCmd(m.token)
 
 	case errMsg:
 		m.isGenerating = false
@@ -327,8 +355,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
-		if m.state == stateProcessingBuy {
-			return m, nil // Block input while loading
+		// Block normal inputs if we are in a loading state
+		if m.state == stateProcessingBuy || m.state == stateScrapingCanvas {
+			return m, nil
 		}
 
 		if m.state == stateAddFood || m.state == stateAddSub {
@@ -403,6 +432,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == stateSubs {
 				limit = len(m.subItems) - 1
 			}
+			if m.state == stateStudy {
+				limit = len(m.studyItems) - 1
+			}
 			if m.state == stateFoodBuy {
 				limit = len(m.buyChoices) - 1
 			}
@@ -452,19 +484,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, syncCategoryCmd(m.token, "Subscriptions", m.catIDs["Subscriptions"], m.subItems)
 			}
 
+		// Replace your old case "s" with this:
+		case "s":
+			if m.state == stateStudy {
+				m.state = stateScrapingCanvas
+				return m, scrapeCanvasCmd(m.token) // Pass the token here
+			}
+
 		// ADD TO CART / REDUCE FROM CART
 		case "right", "+":
 			if m.state == stateFood && len(m.foodItems) > 0 {
-				m.foodItems[m.cursor].CartQty++ // Increase amount we want to buy
+				m.foodItems[m.cursor].CartQty++
 			}
 		case "left", "-":
 			if m.state == stateFood && len(m.foodItems) > 0 {
 				if m.foodItems[m.cursor].CartQty > 0 {
-					m.foodItems[m.cursor].CartQty-- // Decrease amount we want to buy
+					m.foodItems[m.cursor].CartQty--
 				}
 			}
 		case " ":
-			// Space acts as a toggle: If 0, buy 1. If >0, reset to 0.
 			if m.state == stateFood && len(m.foodItems) > 0 {
 				if m.foodItems[m.cursor].CartQty == 0 {
 					m.foodItems[m.cursor].CartQty = 1
@@ -481,7 +519,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				var ingredients []string
 				for _, item := range m.foodItems {
-					// We use CartQty to select ingredients for recipes now
 					if item.CartQty > 0 {
 						ingredients = append(ingredients, item.Name)
 					}
@@ -531,7 +568,7 @@ func (m *model) saveForm() tea.Cmd {
 
 	if m.state == stateAddFood {
 		price, _ := strconv.ParseFloat(m.inputs[1].Value(), 64)
-		amount, _ := strconv.Atoi(m.inputs[2].Value()) // User sets the stock manually
+		amount, _ := strconv.Atoi(m.inputs[2].Value())
 		if amount < 0 {
 			amount = 0
 		}
@@ -539,7 +576,7 @@ func (m *model) saveForm() tea.Cmd {
 
 		newItem := FoodItem{Name: name, Price: price, Amount: amount, RenewThreshold: thresh, CartQty: 0}
 		if m.editIndex >= 0 {
-			newItem.CartQty = m.foodItems[m.editIndex].CartQty // Preserve existing cart choice
+			newItem.CartQty = m.foodItems[m.editIndex].CartQty
 			m.foodItems[m.editIndex] = newItem
 		} else {
 			m.foodItems = append(m.foodItems, newItem)
@@ -570,6 +607,8 @@ func (m *model) goBack() {
 		m.state = stateFood
 	} else if m.state == stateAddSub {
 		m.state = stateSubs
+	} else if m.state == stateScrapingCanvas {
+		m.state = stateStudy
 	} else if m.state != stateMenu {
 		m.state = stateMenu
 	}
@@ -637,13 +676,11 @@ func (m model) View() string {
 					cursor = "▶ "
 				}
 
-				// Render Cart Qty instead of checkmark
 				cartIndicator := "[ ]"
 				if item.CartQty > 0 {
-					// We format it to 2 spaces to keep alignment clean e.g. [ 1] or [12]
 					cartIndicator = checkStyle.Render(fmt.Sprintf("[%2d]", item.CartQty))
 				} else {
-					cartIndicator = "[  ]" // 2 spaces for alignment
+					cartIndicator = "[  ]"
 				}
 
 				nameCol := lipgloss.NewStyle().Width(18).Render(item.Name)
@@ -652,7 +689,6 @@ func (m model) View() string {
 					renewTag = lipgloss.NewStyle().Width(7).Render(lipgloss.NewStyle().Foreground(lipgloss.Color("#E1B12C")).Render(fmt.Sprintf("[R≤%d]", item.RenewThreshold)))
 				}
 
-				// Show both Stock (Amount) and Price
 				line := fmt.Sprintf("  %s %s %s (Stock: %2d) %s -  $%.2f", cursor, cartIndicator, nameCol, item.Amount, renewTag, item.Price)
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
@@ -742,6 +778,12 @@ func (m model) View() string {
 		s += "\n" + hintStyle.Render("[a: Add • e: Edit • d: Delete • up/down: Navigate • Esc: Back]")
 		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(m.statusMsg)
 
+	// NEW: The loading screen that shows while fetching Canvas assignments
+	case stateScrapingCanvas:
+		s += titleStyle.Render("📚 ACADEMICS (Automated Scraper)") + "\n\n"
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("#E1B12C")).Render("⏳ Connecting to Canvas LMS... bypassing CAPTCHA... extracting assignments...")
+		s += "\n\n" + hintStyle.Render("[Scraping... please wait]")
+
 	case stateStudy:
 		s += titleStyle.Render("📚 ACADEMICS") + "\n\n"
 		if len(m.studyItems) == 0 {
@@ -752,7 +794,7 @@ func (m model) View() string {
 				if m.cursor == i {
 					cursor = "▶ "
 				}
-				nameCol := lipgloss.NewStyle().Width(25).Render(item.Name)
+				nameCol := lipgloss.NewStyle().Width(35).Render(item.Name)
 				line := fmt.Sprintf("  %s %s | %s", cursor, nameCol, item.DueDate)
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
@@ -761,7 +803,8 @@ func (m model) View() string {
 				}
 			}
 		}
-		s += "\n" + hintStyle.Render("[up/down: Navigate • Esc: Back]")
+		s += "\n" + hintStyle.Render("[s: Sync Canvas • up/down: Navigate • Esc: Back]")
+		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(m.statusMsg)
 	}
 	return lipgloss.NewStyle().Margin(1, 2).Render(s)
 }
