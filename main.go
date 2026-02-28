@@ -574,13 +574,23 @@ func (m *model) saveForm() tea.Cmd {
 		}
 		thresh, _ := strconv.Atoi(m.inputs[3].Value())
 
+		// --- NEW: AUTO-RENEW LOGIC ---
+		// If threshold is enabled (> 0) and the stock drops to or below the threshold
+		if thresh > 0 && amount <= thresh {
+			amount += 3 // Automatically buy 3 more
+			// Set a custom status message to inform the user!
+			m.statusMsg = fmt.Sprintf("Auto-renew triggered! +3 %s bought 🚚", name)
+		}
+
 		newItem := FoodItem{Name: name, Price: price, Amount: amount, RenewThreshold: thresh, CartQty: 0}
+
 		if m.editIndex >= 0 {
 			newItem.CartQty = m.foodItems[m.editIndex].CartQty
 			m.foodItems[m.editIndex] = newItem
 		} else {
 			m.foodItems = append(m.foodItems, newItem)
 		}
+
 		return syncCategoryCmd(m.token, "Food", m.catIDs["Food"], m.foodItems)
 
 	} else if m.state == stateAddSub {
