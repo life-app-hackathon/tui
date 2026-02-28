@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -13,35 +15,49 @@ import (
 type sessionState int
 
 const (
-	stateMenu       sessionState = iota
-	stateFood                    // Interactive food list
-	stateFoodRecipe              // Generated recipe screen
-	stateFoodBuy                 // Checkout screen (Delivery/Pick Up)
+	stateMenu sessionState = iota
+	stateFood
+	stateFoodRecipe
+	stateFoodBuy
 	stateSubs
 	stateStudy
+	stateAddFood
+	stateAddSub
 )
 
 // --- DATA STRUCTURES ---
 type FoodItem struct {
 	Name     string
 	Price    float64
+	Amount   int
 	Selected bool
+}
+
+type SubItem struct {
+	Name    string
+	Price   float64
+	DueDate string
+}
+
+type StudyItem struct {
+	Name    string
+	DueDate string
 }
 
 // --- MAIN MODEL ---
 type model struct {
 	state  sessionState
-	cursor int // Dynamic cursor for the current screen
+	cursor int
+
+	// Form inputs and tracking
+	inputs     []textinput.Model
+	focusIndex int
 
 	menuChoices []string
-
-	// Food Data
-	foodItems  []FoodItem
-	buyChoices []string
-
-	// Mocks for other categories
-	mockSubs  []string
-	mockStudy []string
+	foodItems   []FoodItem
+	buyChoices  []string
+	subItems    []SubItem
+	studyItems  []StudyItem
 }
 
 func initialModel() model {
@@ -51,50 +67,126 @@ func initialModel() model {
 		menuChoices: []string{
 			"🛒 Food (Tracking, Recipes & Shopping)",
 			"💳 Subscriptions (Payments & Dates)",
-			"📚 Academics (Tasks & Deadlines)",
+			"📚 Academics (Scraped Assignments)",
 		},
 		foodItems: []FoodItem{
-			{Name: "Onions (1kg)", Price: 1.50, Selected: false},
-			{Name: "Tomatoes (1kg)", Price: 2.00, Selected: false},
-			{Name: "Chicken Breast", Price: 5.50, Selected: false},
-			{Name: "Rice (1kg)", Price: 1.20, Selected: false},
-			{Name: "Bell Peppers", Price: 0.90, Selected: false},
+			{Name: "Onions", Price: 1.50, Amount: 2, Selected: false},
+			{Name: "Tomatoes", Price: 2.00, Amount: 3, Selected: false},
+			{Name: "Chicken Breast", Price: 5.50, Amount: 1, Selected: false},
 		},
 		buyChoices: []string{
 			"🚚 Delivery (+$3.00)",
 			"🏪 Pick Up (Free)",
 		},
-		mockSubs: []string{
-			"Netflix   - $15.99 (Due: Mar 05, 2026)",
-			"Spotify   - $10.99 (Due: Mar 12, 2026)",
+		subItems: []SubItem{
+			{Name: "Netflix", Price: 15.99, DueDate: "Mar 05, 2026"},
+			{Name: "Spotify", Price: 10.99, DueDate: "Mar 12, 2026"},
 		},
-		mockStudy: []string{
-			"🔴 Math: Final Exam (Due in 2 days)",
-			"🟡 History: Essay (Due in 5 days)",
+		studyItems: []StudyItem{
+			{Name: "🔴 Math: Final Exam", DueDate: "Due in 2 days"},
+			{Name: "🟡 History: Essay", DueDate: "Due in 5 days"},
 		},
 	}
 }
 
+// Helper to initialize forms dynamically
+func (m *model) initForm(state sessionState) {
+	m.focusIndex = 0
+	m.inputs = make([]textinput.Model, 3)
+
+	for i := range m.inputs {
+		t := textinput.New()
+		t.CharLimit = 32
+		if i == 0 {
+			t.Focus()
+			t.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
+			t.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
+		}
+		m.inputs[i] = t
+	}
+
+	if state == stateAddFood {
+		m.inputs[0].Placeholder = "Food Name (e.g., Apple)"
+		m.inputs[1].Placeholder = "Price (e.g., 2.50)"
+		m.inputs[2].Placeholder = "Amount (e.g., 5)"
+	} else if state == stateAddSub {
+		m.inputs[0].Placeholder = "Service Name (e.g., Netflix)"
+		m.inputs[1].Placeholder = "Price (e.g., 15.99)"
+		m.inputs[2].Placeholder = "Payment Date (e.g., Apr 01, 2026)"
+	}
+}
+
 func (m model) Init() tea.Cmd {
-	return nil
+	return textinput.Blink
 }
 
 // --- UPDATE (Interaction Logic) ---
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+
+		// --- HANDLE FORMS (Adding items) ---
+		if m.state == stateAddFood || m.state == stateAddSub {
+			switch msg.String() {
+			case "esc":
+				m.goBack()
+				return m, nil
+
+			// Navigate between input fields
+			case "tab", "shift+tab", "enter", "up", "down":
+				s := msg.String()
+
+				// If we hit enter on the last field, save the form!
+				if s == "enter" && m.focusIndex == len(m.inputs)-1 {
+					m.saveForm()
+					m.goBack()
+					return m, nil
+				}
+
+				// Move focus
+				if s == "up" || s == "shift+tab" {
+					m.focusIndex--
+				} else {
+					m.focusIndex++
+				}
+
+				if m.focusIndex > len(m.inputs)-1 {
+					m.focusIndex = 0
+				} else if m.focusIndex < 0 {
+					m.focusIndex = len(m.inputs) - 1
+				}
+
+				// Update focus states visually
+				cmds := make([]tea.Cmd, len(m.inputs))
+				for i := 0; i <= len(m.inputs)-1; i++ {
+					if i == m.focusIndex {
+						cmds[i] = m.inputs[i].Focus()
+						m.inputs[i].PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
+						m.inputs[i].TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
+						continue
+					}
+					m.inputs[i].Blur()
+					m.inputs[i].PromptStyle = lipgloss.NewStyle()
+					m.inputs[i].TextStyle = lipgloss.NewStyle()
+				}
+				return m, tea.Batch(cmds...)
+			}
+
+			// Update the currently focused input
+			cmd := m.updateInputs(msg)
+			return m, cmd
+		}
+
+		// --- HANDLE NORMAL NAVIGATION ---
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "q":
 			return m, tea.Quit
 
-		case "esc", "backspace": // Go back
-			if m.state == stateFoodRecipe || m.state == stateFoodBuy {
-				m.state = stateFood // Go back to food list
-				m.cursor = 0
-			} else if m.state != stateMenu {
-				m.state = stateMenu // Go back to main menu
-				m.cursor = 0
-			}
+		case "esc", "backspace":
+			m.goBack()
 
 		case "up", "k":
 			if m.cursor > 0 {
@@ -113,18 +205,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				limit = len(m.buyChoices) - 1
 			}
 			if m.state == stateSubs {
-				limit = len(m.mockSubs) - 1
+				limit = len(m.subItems) - 1
 			}
 			if m.state == stateStudy {
-				limit = len(m.mockStudy) - 1
+				limit = len(m.studyItems) - 1
 			}
 
+			if limit < 0 {
+				limit = 0
+			}
 			if m.cursor < limit {
 				m.cursor++
 			}
 
-		case " ": // SPACE to select/deselect food items
+		case "a": // Add new item (Disabled for Study since it's an automated scraper)
 			if m.state == stateFood {
+				m.state = stateAddFood
+				m.initForm(stateAddFood)
+			} else if m.state == stateSubs {
+				m.state = stateAddSub
+				m.initForm(stateAddSub)
+			}
+
+		case " ": // Toggle food selection
+			if m.state == stateFood && len(m.foodItems) > 0 {
 				m.foodItems[m.cursor].Selected = !m.foodItems[m.cursor].Selected
 			}
 
@@ -133,10 +237,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateFoodRecipe
 			}
 
-		case "c": // Checkout / Buy
+		case "c": // Go to Checkout
 			if m.state == stateFood {
 				m.state = stateFoodBuy
-				m.cursor = 0 // Reset cursor to choose delivery method
+				m.cursor = 0
 			}
 
 		case "enter":
@@ -151,12 +255,63 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.cursor = 0
 			} else if m.state == stateFoodBuy {
-				// Here you would trigger the backend call to save the order
-				return m, tea.Quit // For now, we quit simulating success
+				// Simulate successful purchase
+				for i := range m.foodItems {
+					m.foodItems[i].Selected = false
+				}
+				m.state = stateFood
+				m.cursor = 0
 			}
 		}
 	}
 	return m, nil
+}
+
+// Passes the message to the currently focused input field
+func (m *model) updateInputs(msg tea.Msg) tea.Cmd {
+	cmds := make([]tea.Cmd, len(m.inputs))
+	for i := range m.inputs {
+		m.inputs[i], cmds[i] = m.inputs[i].Update(msg)
+	}
+	return tea.Batch(cmds...)
+}
+
+// Parses form data and saves it to the slices
+func (m *model) saveForm() {
+	name := m.inputs[0].Value()
+	if name == "" {
+		return
+	} // Do not save if name is empty
+
+	if m.state == stateAddFood {
+		price, _ := strconv.ParseFloat(m.inputs[1].Value(), 64)
+		amount, _ := strconv.Atoi(m.inputs[2].Value())
+		if amount == 0 {
+			amount = 1
+		} // Default to 1 if not provided or invalid
+
+		m.foodItems = append(m.foodItems, FoodItem{Name: name, Price: price, Amount: amount, Selected: false})
+	} else if m.state == stateAddSub {
+		price, _ := strconv.ParseFloat(m.inputs[1].Value(), 64)
+		date := m.inputs[2].Value()
+		if date == "" {
+			date = "TBD"
+		}
+
+		m.subItems = append(m.subItems, SubItem{Name: name, Price: price, DueDate: date})
+	}
+}
+
+// Helper to handle going back
+func (m *model) goBack() {
+	if m.state == stateFoodRecipe || m.state == stateFoodBuy || m.state == stateAddFood {
+		m.state = stateFood
+	} else if m.state == stateAddSub {
+		m.state = stateSubs
+	} else if m.state != stateMenu {
+		m.state = stateMenu
+	}
+	m.cursor = 0
 }
 
 // --- STYLES ---
@@ -173,6 +328,20 @@ var (
 func (m model) View() string {
 	var s string
 
+	// 1. Render Forms
+	if m.state == stateAddFood || m.state == stateAddSub {
+		s += titleStyle.Render("➕ ADD NEW ITEM") + "\n\n"
+		for i := range m.inputs {
+			s += m.inputs[i].View()
+			if i < len(m.inputs)-1 {
+				s += "\n"
+			}
+		}
+		s += hintStyle.Render("\n\n[Tab/Up/Down: Next Field • Enter: Save • Esc: Cancel]")
+		return lipgloss.NewStyle().Margin(1, 2).Render(s)
+	}
+
+	// 2. Render Normal Screens
 	switch m.state {
 	case stateMenu:
 		s += titleStyle.Render("⚡ PERSONAL DASHBOARD") + "\n"
@@ -181,25 +350,30 @@ func (m model) View() string {
 
 	case stateFood:
 		s += titleStyle.Render("🛒 FOOD - Inventory") + "\n"
-		for i, item := range m.foodItems {
-			cursor := "  "
-			if m.cursor == i {
-				cursor = "▶ "
-			}
+		if len(m.foodItems) == 0 {
+			s += "  No items. Press 'a' to add one.\n"
+		} else {
+			// Formatting columns: Checkbox | Name | Amount | Price
+			for i, item := range m.foodItems {
+				cursor := "  "
+				if m.cursor == i {
+					cursor = "▶ "
+				}
 
-			check := "[ ]"
-			if item.Selected {
-				check = checkStyle.Render("[x]")
-			}
+				check := "[ ]"
+				if item.Selected {
+					check = checkStyle.Render("[x]")
+				}
 
-			line := fmt.Sprintf("%s %s %-20s ($%.2f)", cursor, check, item.Name, item.Price)
-			if m.cursor == i {
-				s += selStyle.Render(line) + "\n"
-			} else {
-				s += itemStyle.Render(line) + "\n"
+				line := fmt.Sprintf("%s %s %-15s (x%d)  -  $%.2f", cursor, check, item.Name, item.Amount, item.Price)
+				if m.cursor == i {
+					s += selStyle.Render(line) + "\n"
+				} else {
+					s += itemStyle.Render(line) + "\n"
+				}
 			}
 		}
-		s += hintStyle.Render("\n[Space: Select • r: Generate Recipe • c: Checkout • Esc: Back]")
+		s += hintStyle.Render("\n[a: Add • Space: Select • r: Recipe • c: Checkout • Esc: Back]")
 
 	case stateFoodRecipe:
 		s += titleStyle.Render("🍳 GENERATED RECIPE") + "\n"
@@ -224,15 +398,16 @@ func (m model) View() string {
 		var count int
 		for _, item := range m.foodItems {
 			if item.Selected {
-				total += item.Price
+				// Total calculates price * amount
+				total += item.Price * float64(item.Amount)
 				count++
 			}
 		}
 
 		if count == 0 {
-			s += "No items in the cart.\n"
+			s += boxStyle.Render("🛒 No items in the cart.\nGo back and select items with [Space].")
 		} else {
-			s += fmt.Sprintf("Selected items: %d\nSubtotal: $%.2f\n\nChoose delivery method:\n\n", count, total)
+			s += fmt.Sprintf("Selected unique items: %d\nSubtotal: $%.2f\n\nChoose delivery method:\n\n", count, total)
 			for i, choice := range m.buyChoices {
 				cursor := "  "
 				if m.cursor == i {
@@ -247,29 +422,68 @@ func (m model) View() string {
 				}
 			}
 
-			// Calculate dynamic final total
 			shipping := 0.0
 			if m.cursor == 0 {
 				shipping = 3.00
-			} // Delivery
+			}
 			s += fmt.Sprintf("\n💰 TOTAL TO PAY: $%.2f\n", total+shipping)
 		}
-		s += hintStyle.Render("\n[↑/↓: Choose • Enter: Confirm Purchase • Esc: Cancel]")
+
+		if count > 0 {
+			s += hintStyle.Render("\n[↑/↓: Choose • Enter: Confirm Purchase • Esc: Cancel]")
+		} else {
+			s += hintStyle.Render("\n[Esc: Back to Food]")
+		}
 
 	case stateSubs:
 		s += titleStyle.Render("💳 SUBSCRIPTIONS") + "\n"
-		s += renderList(m.mockSubs, m.cursor)
-		s += hintStyle.Render("[↑/↓: Navigate • Esc: Back to Menu]")
+		if len(m.subItems) == 0 {
+			s += "  No items.\n"
+		} else {
+			for i, item := range m.subItems {
+				cursor := "  "
+				if m.cursor == i {
+					cursor = "▶ "
+				}
+
+				line := fmt.Sprintf("%s %-12s | $%.2f | Due: %s", cursor, item.Name, item.Price, item.DueDate)
+				if m.cursor == i {
+					s += selStyle.Render(line) + "\n"
+				} else {
+					s += itemStyle.Render(line) + "\n"
+				}
+			}
+		}
+		s += hintStyle.Render("\n[a: Add • ↑/↓: Navigate • Esc: Back]")
 
 	case stateStudy:
-		s += titleStyle.Render("📚 ACADEMICS") + "\n"
-		s += renderList(m.mockStudy, m.cursor)
-		s += hintStyle.Render("[↑/↓: Navigate • Esc: Back to Menu]")
+		s += titleStyle.Render("📚 ACADEMICS (Automated Scraper)") + "\n"
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("#FAFAFA")).Render("Status: Synced with university portal\n\n")
+
+		if len(m.studyItems) == 0 {
+			s += "  No pending assignments.\n"
+		} else {
+			for i, item := range m.studyItems {
+				cursor := "  "
+				if m.cursor == i {
+					cursor = "▶ "
+				}
+
+				line := fmt.Sprintf("%s %-25s | %s", cursor, item.Name, item.DueDate)
+				if m.cursor == i {
+					s += selStyle.Render(line) + "\n"
+				} else {
+					s += itemStyle.Render(line) + "\n"
+				}
+			}
+		}
+		s += hintStyle.Render("\n[↑/↓: Navigate • Esc: Back]")
 	}
 
 	return lipgloss.NewStyle().Margin(1, 2).Render(s)
 }
 
+// Helper to render simple string lists (Used for the main menu)
 func renderList(items []string, cursor int) string {
 	var s string
 	for i, item := range items {
