@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"time" // Added time for our loading delay
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -25,6 +26,7 @@ const (
 	stateFood
 	stateFoodRecipe
 	stateFoodBuy
+	stateProcessingBuy // NEW: Loading state for checkout
 	stateSubs
 	stateStudy
 	stateAddFood
@@ -63,6 +65,7 @@ type CategoryResponse struct {
 type dataFetchedMsg []CategoryResponse
 type syncSuccessMsg struct{}
 type recipeGeneratedMsg string
+type buyCompleteMsg struct{} // NEW: Signals the purchase is done
 type errMsg struct{ err error }
 
 // --- MAIN MODEL ---
@@ -191,6 +194,14 @@ func generateRecipeCmd(ingredients []string) tea.Cmd {
 	}
 }
 
+// NEW: Command to simulate payment/processing delay
+func processBuyCmd() tea.Cmd {
+	return func() tea.Msg {
+		time.Sleep(1500 * time.Millisecond) // Wait for 1.5 seconds
+		return buyCompleteMsg{}
+	}
+}
+
 // --- FORM INIT ---
 func (m *model) initForm(state sessionState, isEdit bool) {
 	m.focusIndex = 0
@@ -279,12 +290,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case syncSuccessMsg:
 		m.statusMsg = "Saved securely to database ✓"
-		// Re-fetch to ensure we have the newly generated DB IDs if it was a POST
 		return m, fetchCategoriesCmd(m.token)
 
 	case recipeGeneratedMsg:
 		m.isGenerating = false
 		m.generatedRecipe = string(msg)
+		return m, nil
+
+	// NEW: Handle the completed purchase
+	case buyCompleteMsg:
+		for i := range m.foodItems {
+			m.foodItems[i].Selected = false
+		}
+		m.state = stateFood
+		m.cursor = 0
+		m.statusMsg = "Order placed successfully! 🚚"
 		return m, nil
 
 	case errMsg:
@@ -298,6 +318,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
+		}
+
+		// Disable all normal inputs if we are in the loading screen
+		if m.state == stateProcessingBuy {
+			return m, nil
 		}
 
 		if m.state == stateAddFood || m.state == stateAddSub {
@@ -371,11 +396,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == stateSubs {
 				limit = len(m.subItems) - 1
 			}
-
-			if m.state == stateFoodBuy {
+			if m.state == stateFoodBuy { // Fixed limits for the checkout screen
 				limit = len(m.buyChoices) - 1
 			}
-
 			if m.cursor < limit {
 				m.cursor++
 			}
@@ -459,11 +482,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.cursor = 0
 			} else if m.state == stateFoodBuy {
-				for i := range m.foodItems {
-					m.foodItems[i].Selected = false
-				}
-				m.state = stateFood
-				m.cursor = 0
+				// NEW: Go into the loading state instead of instantly finishing
+				m.state = stateProcessingBuy
+				return m, processBuyCmd()
 			}
 		}
 	}
@@ -522,7 +543,7 @@ func (m *model) saveForm() tea.Cmd {
 }
 
 func (m *model) goBack() {
-	if m.state == stateFoodRecipe || m.state == stateFoodBuy || m.state == stateAddFood {
+	if m.state == stateFoodRecipe || m.state == stateFoodBuy || m.state == stateAddFood || m.state == stateProcessingBuy {
 		m.state = stateFood
 	} else if m.state == stateAddSub {
 		m.state = stateSubs
@@ -656,6 +677,12 @@ func (m model) View() string {
 			s += fmt.Sprintf("\n💰 TOTAL TO PAY: $%.2f\n", total+ship)
 		}
 		s += "\n" + hintStyle.Render("[Enter: Buy • Esc: Cancel]")
+
+	// NEW: The loading screen that shows after you press Enter to buy
+	case stateProcessingBuy:
+		s += titleStyle.Render("🚚 PROCESSING ORDER") + "\n\n"
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("#E1B12C")).Render("⏳ Please wait, securely placing your order and processing payment...")
+		s += "\n\n" + hintStyle.Render("[Processing... please do not close]")
 
 	case stateSubs:
 		s += titleStyle.Render("💳 SUBSCRIPTIONS") + "\n"
