@@ -96,6 +96,22 @@ type model struct {
 	isGenerating    bool
 }
 
+// --- OLLAMA STRUCTS ---
+type OllamaMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type OllamaRequest struct {
+	Model    string          `json:"model"`
+	Messages []OllamaMessage `json:"messages"`
+	Stream   bool            `json:"stream"`
+}
+
+type OllamaResponse struct {
+	Message OllamaMessage `json:"message"`
+}
+
 func initialModel(token string) model {
 	return model{
 		state:     stateMenu,
@@ -177,23 +193,48 @@ func syncCategoryCmd(token, name, catId string, items interface{}) tea.Cmd {
 	}
 }
 
+// --- NEW OLLAMA RECIPE COMMAND ---
 func generateRecipeCmd(ingredients []string) tea.Cmd {
 	return func() tea.Msg {
-		payload := map[string][]string{"ingredients": ingredients}
-		body, _ := json.Marshal(payload)
+		// 1. Create a highly optimized prompt for the terminal
+		prompt := fmt.Sprintf(
+			"You are an expert chef. Create a short, simple, and tasty recipe using ONLY these ingredients (you can assume I have basic pantry staples like salt, pepper, water, and cooking oil): %s.\n\n"+
+				"Please keep it concise so it fits on a terminal screen. Use this exact plain-text format:\n"+
+				"TITLE: [Name of Dish]\n\n"+
+				"INGREDIENTS:\n- [Item]\n\n"+
+				"INSTRUCTIONS:\n1. [Step 1]\n2. [Step 2]",
+			strings.Join(ingredients, ", "),
+		)
 
-		resp, err := http.Post(baseURL+"/recipes/generate", "application/json", bytes.NewBuffer(body))
+		// 2. Build the exact JSON payload Ollama expects
+		reqBody := OllamaRequest{
+			Model: "gemma3:1b", // Make sure you have this model pulled via 'ollama pull gemma3:1b'
+			Messages: []OllamaMessage{
+				{Role: "user", Content: prompt},
+			},
+			Stream: false, // We want the whole response at once, not streamed
+		}
+
+		bodyBytes, _ := json.Marshal(reqBody)
+
+		// 3. Send the request to local Ollama
+		resp, err := http.Post("http://localhost:11434/api/chat", "application/json", bytes.NewBuffer(bodyBytes))
 		if err != nil {
-			return errMsg{err}
+			return errMsg{fmt.Errorf("Ollama is not running or unreachable: %v", err)}
 		}
 		defer resp.Body.Close()
 
-		var result map[string]string
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			return errMsg{err}
+		if resp.StatusCode != http.StatusOK {
+			return errMsg{fmt.Errorf("Ollama returned status %d", resp.StatusCode)}
 		}
 
-		return recipeGeneratedMsg(result["recipe"])
+		// 4. Decode the AI's response
+		var result OllamaResponse
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return errMsg{fmt.Errorf("failed to read AI response: %v", err)}
+		}
+
+		return recipeGeneratedMsg(strings.TrimSpace(result.Message.Content))
 	}
 }
 
@@ -517,7 +558,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == stateFood {
 				m.state = stateFoodRecipe
 				m.isGenerating = true
-				m.generatedRecipe = "⏳ Connecting to API and generating recipe..."
+
+				// Updated loading message
+				m.generatedRecipe = "⏳ Asking local AI chef (Ollama)... This might take a few seconds."
 
 				var ingredients []string
 				for _, item := range m.foodItems {
@@ -525,6 +568,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						ingredients = append(ingredients, item.Name)
 					}
 				}
+
+				if len(ingredients) == 0 {
+					m.isGenerating = false
+					m.generatedRecipe = "❌ You haven't added any items to your cart.\nGo back and press 'Right Arrow' to select ingredients."
+					return m, nil
+				}
+
 				return m, generateRecipeCmd(ingredients)
 			}
 
@@ -713,11 +763,15 @@ func (m model) View() string {
 		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(m.statusMsg)
 
 	case stateFoodRecipe:
-		s += titleStyle.Render("🍳 GENERATED RECIPE (API)") + "\n\n"
+		s += titleStyle.Render("🍳 AI GENERATED RECIPE (OLLAMA)") + "\n\n"
+
+		// Set a max width so the AI's text wraps cleanly on screen
+		recipeBox := boxStyle.Copy().Width(60).Render(m.generatedRecipe)
+
 		if m.isGenerating {
 			s += lipgloss.NewStyle().Foreground(lipgloss.Color("#E1B12C")).Render(m.generatedRecipe)
 		} else {
-			s += boxStyle.Render(m.generatedRecipe)
+			s += recipeBox
 		}
 		if !m.isGenerating {
 			s += "\n\n" + hintStyle.Render("[Esc: Back]")
