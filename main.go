@@ -9,14 +9,13 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-const baseURL = "http://localhost:8080"
+const baseURL = "https://backend1.study-with-me.org"
 
 // --- APPLICATION STATES ---
 type sessionState int
@@ -38,7 +37,7 @@ type FoodItem struct {
 	Price          float64 `json:"price"`
 	Amount         int     `json:"amount"`
 	RenewThreshold int     `json:"renewThreshold"`
-	Selected       bool    `json:"-"` // Ignore in DB
+	Selected       bool    `json:"-"`
 }
 
 type SubItem struct {
@@ -60,9 +59,10 @@ type CategoryResponse struct {
 	Content json.RawMessage `json:"content"`
 }
 
-// --- MESSAGES (For async HTTP responses) ---
+// --- MESSAGES ---
 type dataFetchedMsg []CategoryResponse
 type syncSuccessMsg struct{}
+type recipeGeneratedMsg string
 type errMsg struct{ err error }
 
 // --- MAIN MODEL ---
@@ -73,10 +73,8 @@ type model struct {
 	focusIndex int
 	editIndex  int
 	token      string
-	statusMsg  string // Shows sync status at the bottom
-
-	// Store database IDs so we know whether to POST or PUT
-	catIDs map[string]string
+	statusMsg  string
+	catIDs     map[string]string
 
 	subCycleChoices []string
 	subCycleChoice  int
@@ -86,6 +84,10 @@ type model struct {
 	buyChoices  []string
 	subItems    []SubItem
 	studyItems  []StudyItem
+
+	// Recipe Generation State
+	generatedRecipe string
+	isGenerating    bool
 }
 
 func initialModel(token string) model {
@@ -116,8 +118,6 @@ func initialModel(token string) model {
 }
 
 // --- HTTP COMMANDS ---
-
-// Fetches data on startup
 func fetchCategoriesCmd(token string) tea.Cmd {
 	return func() tea.Msg {
 		resp, err := http.Get(baseURL + "/categories/" + token)
@@ -134,36 +134,26 @@ func fetchCategoriesCmd(token string) tea.Cmd {
 	}
 }
 
-// Syncs a specific category slice to the database
 func syncCategoryCmd(token, name, catId string, items interface{}) tea.Cmd {
 	return func() tea.Msg {
-		// Prepare payload
 		contentBytes, _ := json.Marshal(map[string]interface{}{"items": items})
-
-		payload := CategoryResponse{
-			Id:      catId,
-			UserId:  token,
-			Name:    name,
-			Content: contentBytes,
-		}
+		payload := CategoryResponse{Id: catId, UserId: token, Name: name, Content: contentBytes}
 		body, _ := json.Marshal(payload)
 
 		var req *http.Request
 		var err error
 
 		if catId == "" {
-			// Create new category container if it doesn't exist
 			req, err = http.NewRequest("POST", baseURL+"/categories", bytes.NewBuffer(body))
 		} else {
-			// Update existing category array
 			req, err = http.NewRequest("PUT", baseURL+"/categories/"+catId, bytes.NewBuffer(body))
 		}
 
 		if err != nil {
 			return errMsg{err}
 		}
-
 		req.Header.Set("Content-Type", "application/json")
+
 		client := &http.Client{}
 		resp, err := client.Do(req)
 
@@ -175,11 +165,29 @@ func syncCategoryCmd(token, name, catId string, items interface{}) tea.Cmd {
 			return errMsg{fmt.Errorf(msg)}
 		}
 
-		// If it was a POST, we need to read the new ID (Simplified here for brevity)
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-
 		return syncSuccessMsg{}
+	}
+}
+
+func generateRecipeCmd(ingredients []string) tea.Cmd {
+	return func() tea.Msg {
+		payload := map[string][]string{"ingredients": ingredients}
+		body, _ := json.Marshal(payload)
+
+		resp, err := http.Post(baseURL+"/recipes/generate", "application/json", bytes.NewBuffer(body))
+		if err != nil {
+			return errMsg{err}
+		}
+		defer resp.Body.Close()
+
+		var result map[string]string
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return errMsg{err}
+		}
+
+		return recipeGeneratedMsg(result["recipe"])
 	}
 }
 
@@ -202,7 +210,7 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 		m.inputs[0].Placeholder = "Food Name"
 		m.inputs[1].Placeholder = "Price"
 		m.inputs[2].Placeholder = "Amount"
-		m.inputs[3].Placeholder = "Auto-Renew Threshold"
+		m.inputs[3].Placeholder = "Auto-Renew Threshold (0 = disabled)"
 
 		if isEdit && m.editIndex >= 0 {
 			item := m.foodItems[m.editIndex]
@@ -244,7 +252,6 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 }
 
 func (m model) Init() tea.Cmd {
-	// Trigger the API call right away + start the cursor blink
 	return tea.Batch(textinput.Blink, fetchCategoriesCmd(m.token))
 }
 
@@ -252,13 +259,10 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
-	// --- HTTP MESSAGE HANDLERS ---
 	case dataFetchedMsg:
 		m.statusMsg = "Data loaded successfully."
 		for _, cat := range msg {
-			m.catIDs[cat.Name] = cat.Id // Store ID for future PUT requests
-
-			// Extract nested arrays
+			m.catIDs[cat.Name] = cat.Id
 			var wrapper map[string]json.RawMessage
 			json.Unmarshal(cat.Content, &wrapper)
 
@@ -275,13 +279,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case syncSuccessMsg:
 		m.statusMsg = "Saved securely to database ✓"
+		// Re-fetch to ensure we have the newly generated DB IDs if it was a POST
+		return m, fetchCategoriesCmd(m.token)
+
+	case recipeGeneratedMsg:
+		m.isGenerating = false
+		m.generatedRecipe = string(msg)
 		return m, nil
 
 	case errMsg:
+		m.isGenerating = false
 		m.statusMsg = "Error: " + msg.err.Error()
+		if m.state == stateFoodRecipe {
+			m.generatedRecipe = "Server Error: " + msg.err.Error()
+		}
 		return m, nil
 
-	// --- KEYBOARD HANDLING ---
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -306,7 +319,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				totalFields := 4
 
 				if s == "enter" && m.focusIndex == totalFields-1 {
-					cmd := m.saveForm() // Save locally and return the HTTP command
+					cmd := m.saveForm()
 					m.goBack()
 					return m, cmd
 				}
@@ -358,6 +371,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == stateSubs {
 				limit = len(m.subItems) - 1
 			}
+
+			if m.state == stateFoodBuy {
+				limit = len(m.buyChoices) - 1
+			}
+
 			if m.cursor < limit {
 				m.cursor++
 			}
@@ -393,9 +411,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else if len(m.foodItems) == 0 {
 					m.cursor = 0
 				}
-				// Fire sync
 				return m, syncCategoryCmd(m.token, "Food", m.catIDs["Food"], m.foodItems)
-
 			} else if m.state == stateSubs && len(m.subItems) > 0 {
 				m.subItems = append(m.subItems[:m.cursor], m.subItems[m.cursor+1:]...)
 				if m.cursor >= len(m.subItems) && len(m.subItems) > 0 {
@@ -403,7 +419,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else if len(m.subItems) == 0 {
 					m.cursor = 0
 				}
-				// Fire sync
 				return m, syncCategoryCmd(m.token, "Subscriptions", m.catIDs["Subscriptions"], m.subItems)
 			}
 
@@ -411,10 +426,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == stateFood && len(m.foodItems) > 0 {
 				m.foodItems[m.cursor].Selected = !m.foodItems[m.cursor].Selected
 			}
+
 		case "r":
 			if m.state == stateFood {
 				m.state = stateFoodRecipe
+				m.isGenerating = true
+				m.generatedRecipe = "⏳ Connecting to API and generating recipe..."
+
+				var ingredients []string
+				for _, item := range m.foodItems {
+					if item.Selected {
+						ingredients = append(ingredients, item.Name)
+					}
+				}
+				return m, generateRecipeCmd(ingredients)
 			}
+
 		case "c":
 			if m.state == stateFood {
 				m.state = stateFoodBuy
@@ -473,7 +500,6 @@ func (m *model) saveForm() tea.Cmd {
 		} else {
 			m.foodItems = append(m.foodItems, newItem)
 		}
-
 		return syncCategoryCmd(m.token, "Food", m.catIDs["Food"], m.foodItems)
 
 	} else if m.state == stateAddSub {
@@ -490,7 +516,6 @@ func (m *model) saveForm() tea.Cmd {
 		} else {
 			m.subItems = append(m.subItems, newItem)
 		}
-
 		return syncCategoryCmd(m.token, "Subscriptions", m.catIDs["Subscriptions"], m.subItems)
 	}
 	return nil
@@ -587,21 +612,16 @@ func (m model) View() string {
 		s += "\n" + hintStyle.Render("[a: Add • e: Edit • d: Delete • Space: Select • r: Recipe • c: Checkout • Esc: Back]")
 		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(m.statusMsg)
 
-	// ... (Recipe and Checkout views remain standard string formatting)
 	case stateFoodRecipe:
-		s += titleStyle.Render("🍳 GENERATED RECIPE") + "\n"
-		var ingredients []string
-		for _, item := range m.foodItems {
-			if item.Selected {
-				ingredients = append(ingredients, item.Name)
-			}
-		}
-		if len(ingredients) == 0 {
-			s += boxStyle.Render("❌ No items selected.")
+		s += titleStyle.Render("🍳 GENERATED RECIPE (API)") + "\n\n"
+		if m.isGenerating {
+			s += lipgloss.NewStyle().Foreground(lipgloss.Color("#E1B12C")).Render(m.generatedRecipe)
 		} else {
-			s += boxStyle.Render(fmt.Sprintf("Selected:\n- %s\n\n💡 Mix in a pan!", strings.Join(ingredients, "\n- ")))
+			s += boxStyle.Render(m.generatedRecipe)
 		}
-		s += "\n" + hintStyle.Render("[Esc: Back]")
+		if !m.isGenerating {
+			s += "\n\n" + hintStyle.Render("[Esc: Back]")
+		}
 
 	case stateFoodBuy:
 		s += titleStyle.Render("🚚 CHECKOUT") + "\n"
@@ -697,11 +717,12 @@ func renderList(items []string, cursor int) string {
 }
 
 func main() {
-	tokenPtr := flag.String("token", "", "User authentication token")
+	tokenPtr := flag.String("token", "", "User authentication token (Mandatory)")
 	flag.Parse()
 
 	if *tokenPtr == "" {
 		fmt.Println("❌ Error: The --token flag is mandatory.")
+		fmt.Println("Usage: go run main.go --token=user1")
 		os.Exit(1)
 	}
 
