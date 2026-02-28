@@ -28,16 +28,18 @@ const (
 
 // --- DATA STRUCTURES ---
 type FoodItem struct {
-	Name     string
-	Price    float64
-	Amount   int
-	Selected bool
+	Name           string
+	Price          float64
+	Amount         int
+	RenewThreshold int
+	Selected       bool
 }
 
 type SubItem struct {
 	Name    string
 	Price   float64
 	DueDate string
+	Cycle   string
 }
 
 type StudyItem struct {
@@ -51,6 +53,7 @@ type model struct {
 	cursor     int
 	inputs     []textinput.Model
 	focusIndex int
+	editIndex  int // -1 for new item, >= 0 for editing an existing item
 	token      string
 
 	menuChoices []string
@@ -60,12 +63,12 @@ type model struct {
 	studyItems  []StudyItem
 }
 
-// initialModel now acts like a mock database using the token
 func initialModel(token string) model {
 	m := model{
-		state:  stateMenu,
-		cursor: 0,
-		token:  token,
+		state:     stateMenu,
+		cursor:    0,
+		editIndex: -1,
+		token:     token,
 		menuChoices: []string{
 			"🛒 Food (Tracking, Recipes & Shopping)",
 			"💳 Subscriptions (Payments & Dates)",
@@ -77,17 +80,18 @@ func initialModel(token string) model {
 		},
 	}
 
-	// Mock Backend: Load different data based on the token
+	// Mock Backend
 	switch token {
 	case "user1":
 		m.foodItems = []FoodItem{
-			{Name: "Apples", Price: 2.50, Amount: 5, Selected: false},
-			{Name: "Oatmeal", Price: 3.00, Amount: 1, Selected: false},
-			{Name: "Almond Milk", Price: 4.50, Amount: 2, Selected: false},
+			{Name: "Apples", Price: 2.50, Amount: 5, RenewThreshold: 2, Selected: false},
+			{Name: "Oatmeal", Price: 3.00, Amount: 1, RenewThreshold: 1, Selected: false},
+			{Name: "Almond Milk", Price: 4.50, Amount: 2, RenewThreshold: 0, Selected: false},
 		}
 		m.subItems = []SubItem{
-			{Name: "Gym", Price: 30.00, DueDate: "Mar 01, 2026"},
-			{Name: "Spotify", Price: 10.99, DueDate: "Mar 15, 2026"},
+			{Name: "Gym", Price: 30.00, DueDate: "Mar 01, 2026", Cycle: "Monthly"},
+			{Name: "Spotify", Price: 10.99, DueDate: "Mar 15, 2026", Cycle: "Monthly"},
+			{Name: "Domain Name", Price: 12.00, DueDate: "Jan 10, 2027", Cycle: "Yearly"},
 		}
 		m.studyItems = []StudyItem{
 			{Name: "🟢 Biology: Lab Report", DueDate: "Due in 1 day"},
@@ -96,21 +100,18 @@ func initialModel(token string) model {
 
 	case "user2":
 		m.foodItems = []FoodItem{
-			{Name: "Steak", Price: 12.00, Amount: 2, Selected: false},
-			{Name: "Potatoes", Price: 3.50, Amount: 1, Selected: false},
-			{Name: "Eggs (Dozen)", Price: 4.00, Amount: 1, Selected: false},
+			{Name: "Steak", Price: 12.00, Amount: 2, RenewThreshold: 0, Selected: false},
+			{Name: "Eggs (Dozen)", Price: 4.00, Amount: 1, RenewThreshold: 1, Selected: false},
 		}
 		m.subItems = []SubItem{
-			{Name: "Netflix", Price: 15.99, DueDate: "Apr 05, 2026"},
-			{Name: "Amazon Prime", Price: 14.99, DueDate: "Apr 12, 2026"},
+			{Name: "Netflix", Price: 15.99, DueDate: "Apr 05, 2026", Cycle: "Monthly"},
+			{Name: "VPN", Price: 45.00, DueDate: "Aug 12, 2026", Cycle: "Yearly"},
 		}
 		m.studyItems = []StudyItem{
 			{Name: "🔴 Math: Calculus Exam", DueDate: "Due in 10 days"},
-			{Name: "🔴 Physics: Project", DueDate: "Due in 12 days"},
 		}
 
 	default:
-		// Unknown user gets empty lists
 		m.foodItems = []FoodItem{}
 		m.subItems = []SubItem{}
 		m.studyItems = []StudyItem{}
@@ -119,9 +120,10 @@ func initialModel(token string) model {
 	return m
 }
 
-func (m *model) initForm(state sessionState) {
+// initForm now takes a boolean to determine if it should pre-fill the form
+func (m *model) initForm(state sessionState, isEdit bool) {
 	m.focusIndex = 0
-	m.inputs = make([]textinput.Model, 3)
+	m.inputs = make([]textinput.Model, 4)
 
 	for i := range m.inputs {
 		t := textinput.New()
@@ -137,11 +139,32 @@ func (m *model) initForm(state sessionState) {
 	if state == stateAddFood {
 		m.inputs[0].Placeholder = "Food Name (e.g., Apple)"
 		m.inputs[1].Placeholder = "Price (e.g., 2.50)"
-		m.inputs[2].Placeholder = "Amount (e.g., 5)"
+		m.inputs[2].Placeholder = "Current Amount (e.g., 5)"
+		m.inputs[3].Placeholder = "Auto-Renew Threshold (0 = disabled)"
+
+		// Pre-fill if editing
+		if isEdit && m.editIndex >= 0 {
+			item := m.foodItems[m.editIndex]
+			m.inputs[0].SetValue(item.Name)
+			m.inputs[1].SetValue(fmt.Sprintf("%.2f", item.Price))
+			m.inputs[2].SetValue(strconv.Itoa(item.Amount))
+			m.inputs[3].SetValue(strconv.Itoa(item.RenewThreshold))
+		}
+
 	} else if state == stateAddSub {
 		m.inputs[0].Placeholder = "Service Name (e.g., Netflix)"
 		m.inputs[1].Placeholder = "Price (e.g., 15.99)"
 		m.inputs[2].Placeholder = "Payment Date (e.g., Apr 01, 2026)"
+		m.inputs[3].Placeholder = "Cycle (Monthly / 3 Months / Yearly)"
+
+		// Pre-fill if editing
+		if isEdit && m.editIndex >= 0 {
+			item := m.subItems[m.editIndex]
+			m.inputs[0].SetValue(item.Name)
+			m.inputs[1].SetValue(fmt.Sprintf("%.2f", item.Price))
+			m.inputs[2].SetValue(item.DueDate)
+			m.inputs[3].SetValue(item.Cycle)
+		}
 	}
 }
 
@@ -240,13 +263,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.cursor++
 			}
 
-		case "a":
+		case "a": // Add
 			if m.state == stateFood {
 				m.state = stateAddFood
-				m.initForm(stateAddFood)
+				m.editIndex = -1 // -1 means we are creating a new item
+				m.initForm(stateAddFood, false)
 			} else if m.state == stateSubs {
 				m.state = stateAddSub
-				m.initForm(stateAddSub)
+				m.editIndex = -1
+				m.initForm(stateAddSub, false)
+			}
+
+		case "e": // Edit
+			if m.state == stateFood && len(m.foodItems) > 0 {
+				m.state = stateAddFood
+				m.editIndex = m.cursor // Save the index we want to overwrite
+				m.initForm(stateAddFood, true)
+			} else if m.state == stateSubs && len(m.subItems) > 0 {
+				m.state = stateAddSub
+				m.editIndex = m.cursor
+				m.initForm(stateAddSub, true)
 			}
 
 		case " ":
@@ -308,16 +344,36 @@ func (m *model) saveForm() {
 		if amount == 0 {
 			amount = 1
 		}
+		thresh, _ := strconv.Atoi(m.inputs[3].Value())
 
-		m.foodItems = append(m.foodItems, FoodItem{Name: name, Price: price, Amount: amount, Selected: false})
+		newItem := FoodItem{Name: name, Price: price, Amount: amount, RenewThreshold: thresh, Selected: false}
+
+		// If editing, overwrite the item. Otherwise, append.
+		if m.editIndex >= 0 {
+			newItem.Selected = m.foodItems[m.editIndex].Selected // Preserve checkbox state
+			m.foodItems[m.editIndex] = newItem
+		} else {
+			m.foodItems = append(m.foodItems, newItem)
+		}
+
 	} else if m.state == stateAddSub {
 		price, _ := strconv.ParseFloat(m.inputs[1].Value(), 64)
 		date := m.inputs[2].Value()
 		if date == "" {
 			date = "TBD"
 		}
+		cycle := m.inputs[3].Value()
+		if cycle == "" {
+			cycle = "Monthly"
+		}
 
-		m.subItems = append(m.subItems, SubItem{Name: name, Price: price, DueDate: date})
+		newItem := SubItem{Name: name, Price: price, DueDate: date, Cycle: cycle}
+
+		if m.editIndex >= 0 {
+			m.subItems[m.editIndex] = newItem
+		} else {
+			m.subItems = append(m.subItems, newItem)
+		}
 	}
 }
 
@@ -347,7 +403,13 @@ func (m model) View() string {
 	var s string
 
 	if m.state == stateAddFood || m.state == stateAddSub {
-		s += titleStyle.Render("➕ ADD NEW ITEM") + "\n\n"
+		// Change the title dynamically based on if we are adding or editing
+		if m.editIndex >= 0 {
+			s += titleStyle.Render("✏️ EDIT ITEM") + "\n\n"
+		} else {
+			s += titleStyle.Render("➕ ADD NEW ITEM") + "\n\n"
+		}
+
 		for i := range m.inputs {
 			s += m.inputs[i].View()
 			if i < len(m.inputs)-1 {
@@ -361,7 +423,11 @@ func (m model) View() string {
 	switch m.state {
 	case stateMenu:
 		s += titleStyle.Render("⚡ PERSONAL DASHBOARD") + "\n"
-		s += lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(fmt.Sprintf("🔑 Authenticated as: %s", m.token)) + "\n\n"
+		if m.token != "" {
+			s += lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(fmt.Sprintf("🔑 Authenticated as: %s", m.token)) + "\n\n"
+		} else {
+			s += lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F87")).Render("⚠️  No token provided. Running locally.") + "\n\n"
+		}
 
 		s += renderList(m.menuChoices, m.cursor)
 		s += "\n" + hintStyle.Render("[up/down: Navigate • Enter: Select • q: Quit]")
@@ -383,7 +449,14 @@ func (m model) View() string {
 				}
 
 				nameCol := lipgloss.NewStyle().Width(18).Render(item.Name)
-				line := fmt.Sprintf("  %s %s %s (x%d)  -  $%.2f", cursor, check, nameCol, item.Amount, item.Price)
+
+				renewTag := "       "
+				if item.RenewThreshold > 0 {
+					renewTag = lipgloss.NewStyle().Foreground(lipgloss.Color("#E1B12C")).Render(fmt.Sprintf("[R≤%d]", item.RenewThreshold))
+					renewTag = lipgloss.NewStyle().Width(7).Render(renewTag)
+				}
+
+				line := fmt.Sprintf("  %s %s %s (x%d) %s -  $%.2f", cursor, check, nameCol, item.Amount, renewTag, item.Price)
 
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
@@ -392,7 +465,7 @@ func (m model) View() string {
 				}
 			}
 		}
-		s += "\n" + hintStyle.Render("[a: Add • Space: Select • r: Recipe • c: Checkout • Esc: Back]")
+		s += "\n" + hintStyle.Render("[a: Add • e: Edit • Space: Select • r: Recipe • c: Checkout • Esc: Back]")
 
 	case stateFoodRecipe:
 		s += titleStyle.Render("🍳 GENERATED RECIPE") + "\n"
@@ -465,7 +538,9 @@ func (m model) View() string {
 				}
 
 				nameCol := lipgloss.NewStyle().Width(15).Render(item.Name)
-				line := fmt.Sprintf("  %s %s | $%.2f | Due: %s", cursor, nameCol, item.Price, item.DueDate)
+				cycleCol := lipgloss.NewStyle().Width(10).Render(item.Cycle)
+
+				line := fmt.Sprintf("  %s %s | %s | $%.2f | Due: %s", cursor, nameCol, cycleCol, item.Price, item.DueDate)
 
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
@@ -474,7 +549,7 @@ func (m model) View() string {
 				}
 			}
 		}
-		s += "\n" + hintStyle.Render("[a: Add • up/down: Navigate • Esc: Back]")
+		s += "\n" + hintStyle.Render("[a: Add • e: Edit • up/down: Navigate • Esc: Back]")
 
 	case stateStudy:
 		s += titleStyle.Render("📚 ACADEMICS (Automated Scraper)") + "\n"
@@ -521,7 +596,6 @@ func main() {
 	tokenPtr := flag.String("token", "", "User authentication token (Mandatory)")
 	flag.Parse()
 
-	// 1. Validate that the token is present
 	if *tokenPtr == "" {
 		fmt.Println("❌ Error: The --token flag is mandatory.")
 		fmt.Println("Usage: go run main.go --token=user1")
