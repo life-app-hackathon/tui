@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -832,16 +834,41 @@ func renderList(items []string, cursor int) string {
 }
 
 func main() {
-	tokenPtr := flag.String("token", "", "User authentication token (Mandatory)")
+	tokenPtr := flag.String("token", "", "User authentication token (Mandatory for first run)")
 	flag.Parse()
 
-	if *tokenPtr == "" {
-		fmt.Println("❌ Error: The --token flag is mandatory.")
-		fmt.Println("Usage: go run main.go --token=user1")
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Println("❌ Error finding home directory:", err)
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(initialModel(*tokenPtr), tea.WithAltScreen())
+	tokenFile := filepath.Join(homeDir, ".dashboard_token")
+	var finalToken string
+
+	if *tokenPtr != "" {
+		finalToken = *tokenPtr
+		err := os.WriteFile(tokenFile, []byte(finalToken), 0600)
+		if err != nil {
+			fmt.Printf("⚠️ Warning: Could not save token to %s: %v\n", tokenFile, err)
+		}
+	} else {
+
+		data, err := os.ReadFile(tokenFile)
+		if err == nil {
+			finalToken = strings.TrimSpace(string(data))
+		}
+
+		if finalToken == "" {
+			fmt.Println("❌ Error: No token found.")
+			fmt.Println("For your very first run, you must provide your token to link your account.")
+			fmt.Println("It will be saved automatically for future uses.")
+			fmt.Println("\nUsage: go run main.go --token=user1")
+			os.Exit(1)
+		}
+	}
+
+	p := tea.NewProgram(initialModel(finalToken), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error starting TUI: %v\n", err)
 		os.Exit(1)
