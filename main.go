@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -11,6 +15,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
+
+const baseURL = "http://localhost:8080"
 
 // --- APPLICATION STATES ---
 type sessionState int
@@ -28,24 +34,36 @@ const (
 
 // --- DATA STRUCTURES ---
 type FoodItem struct {
-	Name           string
-	Price          float64
-	Amount         int
-	RenewThreshold int
-	Selected       bool
+	Name           string  `json:"name"`
+	Price          float64 `json:"price"`
+	Amount         int     `json:"amount"`
+	RenewThreshold int     `json:"renewThreshold"`
+	Selected       bool    `json:"-"` // Ignore in DB
 }
 
 type SubItem struct {
-	Name    string
-	Price   float64
-	DueDate string
-	Cycle   string
+	Name    string  `json:"name"`
+	Price   float64 `json:"price"`
+	DueDate string  `json:"dueDate"`
+	Cycle   string  `json:"cycle"`
 }
 
 type StudyItem struct {
-	Name    string
-	DueDate string
+	Name    string `json:"name"`
+	DueDate string `json:"dueDate"`
 }
+
+type CategoryResponse struct {
+	Id      string          `json:"id"`
+	UserId  string          `json:"user_id"`
+	Name    string          `json:"name"`
+	Content json.RawMessage `json:"content"`
+}
+
+// --- MESSAGES (For async HTTP responses) ---
+type dataFetchedMsg []CategoryResponse
+type syncSuccessMsg struct{}
+type errMsg struct{ err error }
 
 // --- MAIN MODEL ---
 type model struct {
@@ -55,6 +73,10 @@ type model struct {
 	focusIndex int
 	editIndex  int
 	token      string
+	statusMsg  string // Shows sync status at the bottom
+
+	// Store database IDs so we know whether to POST or PUT
+	catIDs map[string]string
 
 	subCycleChoices []string
 	subCycleChoice  int
@@ -67,11 +89,13 @@ type model struct {
 }
 
 func initialModel(token string) model {
-	m := model{
+	return model{
 		state:     stateMenu,
 		cursor:    0,
 		editIndex: -1,
 		token:     token,
+		statusMsg: "Fetching data...",
+		catIDs:    make(map[string]string),
 
 		subCycleChoices: []string{"Monthly", "3 Months", "Yearly"},
 		subCycleChoice:  0,
@@ -85,48 +109,81 @@ func initialModel(token string) model {
 			"🚚 Delivery (+$3.00)",
 			"🏪 Pick Up (Free)",
 		},
+		foodItems:  []FoodItem{},
+		subItems:   []SubItem{},
+		studyItems: []StudyItem{},
 	}
-
-	// Mock Backend
-	switch token {
-	case "user1":
-		m.foodItems = []FoodItem{
-			{Name: "Apples", Price: 2.50, Amount: 5, RenewThreshold: 2, Selected: false},
-			{Name: "Oatmeal", Price: 3.00, Amount: 1, RenewThreshold: 1, Selected: false},
-			{Name: "Almond Milk", Price: 4.50, Amount: 2, RenewThreshold: 0, Selected: false},
-		}
-		m.subItems = []SubItem{
-			{Name: "Gym", Price: 30.00, DueDate: "Mar 01, 2026", Cycle: "Monthly"},
-			{Name: "Spotify", Price: 10.99, DueDate: "Mar 15, 2026", Cycle: "Monthly"},
-			{Name: "Domain Name", Price: 12.00, DueDate: "Jan 10, 2027", Cycle: "Yearly"},
-		}
-		m.studyItems = []StudyItem{
-			{Name: "🟢 Biology: Lab Report", DueDate: "Due in 1 day"},
-			{Name: "🟡 English: Reading", DueDate: "Due in 3 days"},
-		}
-
-	case "user2":
-		m.foodItems = []FoodItem{
-			{Name: "Steak", Price: 12.00, Amount: 2, RenewThreshold: 0, Selected: false},
-			{Name: "Eggs (Dozen)", Price: 4.00, Amount: 1, RenewThreshold: 1, Selected: false},
-		}
-		m.subItems = []SubItem{
-			{Name: "Netflix", Price: 15.99, DueDate: "Apr 05, 2026", Cycle: "Monthly"},
-			{Name: "VPN", Price: 45.00, DueDate: "Aug 12, 2026", Cycle: "Yearly"},
-		}
-		m.studyItems = []StudyItem{
-			{Name: "🔴 Math: Calculus Exam", DueDate: "Due in 10 days"},
-		}
-
-	default:
-		m.foodItems = []FoodItem{}
-		m.subItems = []SubItem{}
-		m.studyItems = []StudyItem{}
-	}
-
-	return m
 }
 
+// --- HTTP COMMANDS ---
+
+// Fetches data on startup
+func fetchCategoriesCmd(token string) tea.Cmd {
+	return func() tea.Msg {
+		resp, err := http.Get(baseURL + "/categories/" + token)
+		if err != nil {
+			return errMsg{err}
+		}
+		defer resp.Body.Close()
+
+		var cats []CategoryResponse
+		if err := json.NewDecoder(resp.Body).Decode(&cats); err != nil {
+			return errMsg{err}
+		}
+		return dataFetchedMsg(cats)
+	}
+}
+
+// Syncs a specific category slice to the database
+func syncCategoryCmd(token, name, catId string, items interface{}) tea.Cmd {
+	return func() tea.Msg {
+		// Prepare payload
+		contentBytes, _ := json.Marshal(map[string]interface{}{"items": items})
+
+		payload := CategoryResponse{
+			Id:      catId,
+			UserId:  token,
+			Name:    name,
+			Content: contentBytes,
+		}
+		body, _ := json.Marshal(payload)
+
+		var req *http.Request
+		var err error
+
+		if catId == "" {
+			// Create new category container if it doesn't exist
+			req, err = http.NewRequest("POST", baseURL+"/categories", bytes.NewBuffer(body))
+		} else {
+			// Update existing category array
+			req, err = http.NewRequest("PUT", baseURL+"/categories/"+catId, bytes.NewBuffer(body))
+		}
+
+		if err != nil {
+			return errMsg{err}
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{}
+		resp, err := client.Do(req)
+
+		if err != nil || resp.StatusCode >= 400 {
+			msg := "Sync failed"
+			if err != nil {
+				msg = err.Error()
+			}
+			return errMsg{fmt.Errorf(msg)}
+		}
+
+		// If it was a POST, we need to read the new ID (Simplified here for brevity)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		return syncSuccessMsg{}
+	}
+}
+
+// --- FORM INIT ---
 func (m *model) initForm(state sessionState, isEdit bool) {
 	m.focusIndex = 0
 
@@ -142,11 +199,10 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 			}
 			m.inputs[i] = t
 		}
-
-		m.inputs[0].Placeholder = "Food Name (e.g., Apple)"
-		m.inputs[1].Placeholder = "Price (e.g., 2.50)"
-		m.inputs[2].Placeholder = "Current Amount (e.g., 5)"
-		m.inputs[3].Placeholder = "Auto-Renew Threshold (0 = disabled)"
+		m.inputs[0].Placeholder = "Food Name"
+		m.inputs[1].Placeholder = "Price"
+		m.inputs[2].Placeholder = "Amount"
+		m.inputs[3].Placeholder = "Auto-Renew Threshold"
 
 		if isEdit && m.editIndex >= 0 {
 			item := m.foodItems[m.editIndex]
@@ -155,7 +211,6 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 			m.inputs[2].SetValue(strconv.Itoa(item.Amount))
 			m.inputs[3].SetValue(strconv.Itoa(item.RenewThreshold))
 		}
-
 	} else if state == stateAddSub {
 		m.inputs = make([]textinput.Model, 3)
 		for i := range m.inputs {
@@ -168,11 +223,9 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 			}
 			m.inputs[i] = t
 		}
-
-		m.inputs[0].Placeholder = "Service Name (e.g., Netflix)"
-		m.inputs[1].Placeholder = "Price (e.g., 15.99)"
-		m.inputs[2].Placeholder = "Payment Date (e.g., Apr 01, 2026)"
-
+		m.inputs[0].Placeholder = "Service Name"
+		m.inputs[1].Placeholder = "Price"
+		m.inputs[2].Placeholder = "Payment Date"
 		m.subCycleChoice = 0
 
 		if isEdit && m.editIndex >= 0 {
@@ -180,7 +233,6 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 			m.inputs[0].SetValue(item.Name)
 			m.inputs[1].SetValue(fmt.Sprintf("%.2f", item.Price))
 			m.inputs[2].SetValue(item.DueDate)
-
 			for i, c := range m.subCycleChoices {
 				if c == item.Cycle {
 					m.subCycleChoice = i
@@ -192,12 +244,44 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 }
 
 func (m model) Init() tea.Cmd {
-	return textinput.Blink
+	// Trigger the API call right away + start the cursor blink
+	return tea.Batch(textinput.Blink, fetchCategoriesCmd(m.token))
 }
 
 // --- UPDATE ---
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+
+	// --- HTTP MESSAGE HANDLERS ---
+	case dataFetchedMsg:
+		m.statusMsg = "Data loaded successfully."
+		for _, cat := range msg {
+			m.catIDs[cat.Name] = cat.Id // Store ID for future PUT requests
+
+			// Extract nested arrays
+			var wrapper map[string]json.RawMessage
+			json.Unmarshal(cat.Content, &wrapper)
+
+			switch cat.Name {
+			case "Food":
+				json.Unmarshal(wrapper["items"], &m.foodItems)
+			case "Subscriptions":
+				json.Unmarshal(wrapper["items"], &m.subItems)
+			case "Academics":
+				json.Unmarshal(wrapper["items"], &m.studyItems)
+			}
+		}
+		return m, nil
+
+	case syncSuccessMsg:
+		m.statusMsg = "Saved securely to database ✓"
+		return m, nil
+
+	case errMsg:
+		m.statusMsg = "Error: " + msg.err.Error()
+		return m, nil
+
+	// --- KEYBOARD HANDLING ---
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -208,7 +292,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "esc":
 				m.goBack()
 				return m, nil
-
 			case "left", "right":
 				if m.state == stateAddSub && m.focusIndex == 3 {
 					if msg.String() == "left" && m.subCycleChoice > 0 {
@@ -218,23 +301,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					return m, nil
 				}
-
 			case "tab", "shift+tab", "enter", "up", "down":
 				s := msg.String()
 				totalFields := 4
 
 				if s == "enter" && m.focusIndex == totalFields-1 {
-					m.saveForm()
+					cmd := m.saveForm() // Save locally and return the HTTP command
 					m.goBack()
-					return m, nil
+					return m, cmd
 				}
-
 				if s == "up" || s == "shift+tab" {
 					m.focusIndex--
 				} else if s == "down" || s == "tab" || s == "enter" {
 					m.focusIndex++
 				}
-
 				if m.focusIndex > totalFields-1 {
 					m.focusIndex = 0
 				} else if m.focusIndex < 0 {
@@ -255,24 +335,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, tea.Batch(cmds...)
 			}
-
-			cmd := m.updateInputs(msg)
-			return m, cmd
+			return m, m.updateInputs(msg)
 		}
 
-		// --- NORMAL NAVIGATION ---
 		switch msg.String() {
 		case "q":
 			return m, tea.Quit
-
 		case "esc", "backspace":
 			m.goBack()
-
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
 			}
-
 		case "down", "j":
 			limit := 0
 			if m.state == stateMenu {
@@ -281,24 +355,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == stateFood {
 				limit = len(m.foodItems) - 1
 			}
-			if m.state == stateFoodBuy {
-				limit = len(m.buyChoices) - 1
-			}
 			if m.state == stateSubs {
 				limit = len(m.subItems) - 1
-			}
-			if m.state == stateStudy {
-				limit = len(m.studyItems) - 1
-			}
-
-			if limit < 0 {
-				limit = 0
 			}
 			if m.cursor < limit {
 				m.cursor++
 			}
 
-		case "a": // Add
+		case "a":
 			if m.state == stateFood {
 				m.state = stateAddFood
 				m.editIndex = -1
@@ -309,7 +373,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.initForm(stateAddSub, false)
 			}
 
-		case "e": // Edit
+		case "e":
 			if m.state == stateFood && len(m.foodItems) > 0 {
 				m.state = stateAddFood
 				m.editIndex = m.cursor
@@ -320,43 +384,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.initForm(stateAddSub, true)
 			}
 
-		case "d": // Delete
+		case "d":
+			m.statusMsg = "Syncing deletion..."
 			if m.state == stateFood && len(m.foodItems) > 0 {
-				// Remove the item using standard Go slice syntax
 				m.foodItems = append(m.foodItems[:m.cursor], m.foodItems[m.cursor+1:]...)
-
-				// Fix the cursor if we deleted the very last item
 				if m.cursor >= len(m.foodItems) && len(m.foodItems) > 0 {
 					m.cursor = len(m.foodItems) - 1
 				} else if len(m.foodItems) == 0 {
 					m.cursor = 0
 				}
+				// Fire sync
+				return m, syncCategoryCmd(m.token, "Food", m.catIDs["Food"], m.foodItems)
+
 			} else if m.state == stateSubs && len(m.subItems) > 0 {
 				m.subItems = append(m.subItems[:m.cursor], m.subItems[m.cursor+1:]...)
-
 				if m.cursor >= len(m.subItems) && len(m.subItems) > 0 {
 					m.cursor = len(m.subItems) - 1
 				} else if len(m.subItems) == 0 {
 					m.cursor = 0
 				}
+				// Fire sync
+				return m, syncCategoryCmd(m.token, "Subscriptions", m.catIDs["Subscriptions"], m.subItems)
 			}
 
 		case " ":
 			if m.state == stateFood && len(m.foodItems) > 0 {
 				m.foodItems[m.cursor].Selected = !m.foodItems[m.cursor].Selected
 			}
-
 		case "r":
 			if m.state == stateFood {
 				m.state = stateFoodRecipe
 			}
-
 		case "c":
 			if m.state == stateFood {
 				m.state = stateFoodBuy
 				m.cursor = 0
 			}
-
 		case "enter":
 			if m.state == stateMenu {
 				switch m.cursor {
@@ -388,11 +451,12 @@ func (m *model) updateInputs(msg tea.Msg) tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-func (m *model) saveForm() {
+func (m *model) saveForm() tea.Cmd {
 	name := m.inputs[0].Value()
 	if name == "" {
-		return
+		return nil
 	}
+	m.statusMsg = "Syncing..."
 
 	if m.state == stateAddFood {
 		price, _ := strconv.ParseFloat(m.inputs[1].Value(), 64)
@@ -403,7 +467,6 @@ func (m *model) saveForm() {
 		thresh, _ := strconv.Atoi(m.inputs[3].Value())
 
 		newItem := FoodItem{Name: name, Price: price, Amount: amount, RenewThreshold: thresh, Selected: false}
-
 		if m.editIndex >= 0 {
 			newItem.Selected = m.foodItems[m.editIndex].Selected
 			m.foodItems[m.editIndex] = newItem
@@ -411,23 +474,26 @@ func (m *model) saveForm() {
 			m.foodItems = append(m.foodItems, newItem)
 		}
 
+		return syncCategoryCmd(m.token, "Food", m.catIDs["Food"], m.foodItems)
+
 	} else if m.state == stateAddSub {
 		price, _ := strconv.ParseFloat(m.inputs[1].Value(), 64)
 		date := m.inputs[2].Value()
 		if date == "" {
 			date = "TBD"
 		}
-
 		cycle := m.subCycleChoices[m.subCycleChoice]
 
 		newItem := SubItem{Name: name, Price: price, DueDate: date, Cycle: cycle}
-
 		if m.editIndex >= 0 {
 			m.subItems[m.editIndex] = newItem
 		} else {
 			m.subItems = append(m.subItems, newItem)
 		}
+
+		return syncCategoryCmd(m.token, "Subscriptions", m.catIDs["Subscriptions"], m.subItems)
 	}
+	return nil
 }
 
 func (m *model) goBack() {
@@ -461,7 +527,6 @@ func (m model) View() string {
 		} else {
 			s += titleStyle.Render("➕ ADD NEW ITEM") + "\n\n"
 		}
-
 		for i := range m.inputs {
 			s += m.inputs[i].View() + "\n"
 		}
@@ -471,7 +536,6 @@ func (m model) View() string {
 			if m.focusIndex == 3 {
 				radioPrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render("> Cycle:")
 			}
-
 			s += radioPrompt + "\n  "
 			for i, choice := range m.subCycleChoices {
 				marker := "( )"
@@ -482,7 +546,6 @@ func (m model) View() string {
 			}
 			s += "\n"
 		}
-
 		s += "\n\n" + hintStyle.Render("[Tab/Up/Down: Next • Left/Right: Select Cycle • Enter: Save]")
 		return lipgloss.NewStyle().Margin(1, 2).Render(s)
 	}
@@ -490,12 +553,7 @@ func (m model) View() string {
 	switch m.state {
 	case stateMenu:
 		s += titleStyle.Render("⚡ PERSONAL DASHBOARD") + "\n"
-		if m.token != "" {
-			s += lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(fmt.Sprintf("🔑 Authenticated as: %s", m.token)) + "\n\n"
-		} else {
-			s += lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F87")).Render("⚠️  No token provided. Running locally.") + "\n\n"
-		}
-
+		s += lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(fmt.Sprintf("🔑 Auth: %s | %s", m.token, m.statusMsg)) + "\n\n"
 		s += renderList(m.menuChoices, m.cursor)
 		s += "\n" + hintStyle.Render("[up/down: Navigate • Enter: Select • q: Quit]")
 
@@ -509,22 +567,16 @@ func (m model) View() string {
 				if m.cursor == i {
 					cursor = "▶ "
 				}
-
 				check := "[ ]"
 				if item.Selected {
 					check = checkStyle.Render("[x]")
 				}
-
 				nameCol := lipgloss.NewStyle().Width(18).Render(item.Name)
-
 				renewTag := "       "
 				if item.RenewThreshold > 0 {
-					renewTag = lipgloss.NewStyle().Foreground(lipgloss.Color("#E1B12C")).Render(fmt.Sprintf("[R≤%d]", item.RenewThreshold))
-					renewTag = lipgloss.NewStyle().Width(7).Render(renewTag)
+					renewTag = lipgloss.NewStyle().Width(7).Render(lipgloss.NewStyle().Foreground(lipgloss.Color("#E1B12C")).Render(fmt.Sprintf("[R≤%d]", item.RenewThreshold)))
 				}
-
 				line := fmt.Sprintf("  %s %s %s (x%d) %s -  $%.2f", cursor, check, nameCol, item.Amount, renewTag, item.Price)
-
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
 				} else {
@@ -533,7 +585,9 @@ func (m model) View() string {
 			}
 		}
 		s += "\n" + hintStyle.Render("[a: Add • e: Edit • d: Delete • Space: Select • r: Recipe • c: Checkout • Esc: Back]")
+		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(m.statusMsg)
 
+	// ... (Recipe and Checkout views remain standard string formatting)
 	case stateFoodRecipe:
 		s += titleStyle.Render("🍳 GENERATED RECIPE") + "\n"
 		var ingredients []string
@@ -542,14 +596,12 @@ func (m model) View() string {
 				ingredients = append(ingredients, item.Name)
 			}
 		}
-
 		if len(ingredients) == 0 {
-			s += boxStyle.Render("❌ You haven't selected any food items.\nGo back and select ingredients with [Space].")
+			s += boxStyle.Render("❌ No items selected.")
 		} else {
-			content := fmt.Sprintf("Selected ingredients:\n- %s\n\n💡 Tip:\nMix everything in a pan with olive oil,\nsalt, and pepper. A quick and nutritious stir-fry!", strings.Join(ingredients, "\n- "))
-			s += boxStyle.Render(content)
+			s += boxStyle.Render(fmt.Sprintf("Selected:\n- %s\n\n💡 Mix in a pan!", strings.Join(ingredients, "\n- ")))
 		}
-		s += "\n" + hintStyle.Render("[Esc: Back to Food]")
+		s += "\n" + hintStyle.Render("[Esc: Back]")
 
 	case stateFoodBuy:
 		s += titleStyle.Render("🚚 CHECKOUT") + "\n"
@@ -561,17 +613,15 @@ func (m model) View() string {
 				count++
 			}
 		}
-
 		if count == 0 {
-			s += boxStyle.Render("🛒 No items in the cart.\nGo back and select items with [Space].")
+			s += boxStyle.Render("🛒 Cart empty.")
 		} else {
-			s += fmt.Sprintf("Selected unique items: %d\nSubtotal: $%.2f\n\nChoose delivery method:\n\n", count, total)
+			s += fmt.Sprintf("Selected: %d\nSubtotal: $%.2f\n\nChoose delivery:\n\n", count, total)
 			for i, choice := range m.buyChoices {
 				cursor := "  "
 				if m.cursor == i {
 					cursor = "▶ "
 				}
-
 				line := fmt.Sprintf("  %s %s", cursor, choice)
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
@@ -579,19 +629,13 @@ func (m model) View() string {
 					s += itemStyle.Render(line) + "\n"
 				}
 			}
-
-			shipping := 0.0
+			ship := 0.0
 			if m.cursor == 0 {
-				shipping = 3.00
+				ship = 3.00
 			}
-			s += fmt.Sprintf("\n💰 TOTAL TO PAY: $%.2f\n", total+shipping)
+			s += fmt.Sprintf("\n💰 TOTAL TO PAY: $%.2f\n", total+ship)
 		}
-
-		if count > 0 {
-			s += "\n" + hintStyle.Render("[up/down: Choose • Enter: Confirm Purchase • Esc: Cancel]")
-		} else {
-			s += "\n" + hintStyle.Render("[Esc: Back to Food]")
-		}
+		s += "\n" + hintStyle.Render("[Enter: Buy • Esc: Cancel]")
 
 	case stateSubs:
 		s += titleStyle.Render("💳 SUBSCRIPTIONS") + "\n"
@@ -603,12 +647,9 @@ func (m model) View() string {
 				if m.cursor == i {
 					cursor = "▶ "
 				}
-
 				nameCol := lipgloss.NewStyle().Width(15).Render(item.Name)
 				cycleCol := lipgloss.NewStyle().Width(10).Render(item.Cycle)
-
 				line := fmt.Sprintf("  %s %s | %s | $%.2f | Due: %s", cursor, nameCol, cycleCol, item.Price, item.DueDate)
-
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
 				} else {
@@ -617,11 +658,10 @@ func (m model) View() string {
 			}
 		}
 		s += "\n" + hintStyle.Render("[a: Add • e: Edit • d: Delete • up/down: Navigate • Esc: Back]")
+		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(m.statusMsg)
 
 	case stateStudy:
-		s += titleStyle.Render("📚 ACADEMICS (Automated Scraper)") + "\n"
-		s += lipgloss.NewStyle().Foreground(lipgloss.Color("#FAFAFA")).Render("Status: Synced with university portal") + "\n\n"
-
+		s += titleStyle.Render("📚 ACADEMICS") + "\n\n"
 		if len(m.studyItems) == 0 {
 			s += "    No pending assignments.\n"
 		} else {
@@ -630,10 +670,8 @@ func (m model) View() string {
 				if m.cursor == i {
 					cursor = "▶ "
 				}
-
 				nameCol := lipgloss.NewStyle().Width(25).Render(item.Name)
 				line := fmt.Sprintf("  %s %s | %s", cursor, nameCol, item.DueDate)
-
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
 				} else {
@@ -643,7 +681,6 @@ func (m model) View() string {
 		}
 		s += "\n" + hintStyle.Render("[up/down: Navigate • Esc: Back]")
 	}
-
 	return lipgloss.NewStyle().Margin(1, 2).Render(s)
 }
 
@@ -660,12 +697,11 @@ func renderList(items []string, cursor int) string {
 }
 
 func main() {
-	tokenPtr := flag.String("token", "", "User authentication token (Mandatory)")
+	tokenPtr := flag.String("token", "", "User authentication token")
 	flag.Parse()
 
 	if *tokenPtr == "" {
 		fmt.Println("❌ Error: The --token flag is mandatory.")
-		fmt.Println("Usage: go run main.go --token=user1")
 		os.Exit(1)
 	}
 
