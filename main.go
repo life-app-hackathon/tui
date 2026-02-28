@@ -53,8 +53,12 @@ type model struct {
 	cursor     int
 	inputs     []textinput.Model
 	focusIndex int
-	editIndex  int // -1 for new item, >= 0 for editing an existing item
+	editIndex  int
 	token      string
+
+	// Radio button states for Subscriptions
+	subCycleChoices []string
+	subCycleChoice  int
 
 	menuChoices []string
 	foodItems   []FoodItem
@@ -69,6 +73,11 @@ func initialModel(token string) model {
 		cursor:    0,
 		editIndex: -1,
 		token:     token,
+
+		// Initialize the radio button options
+		subCycleChoices: []string{"Monthly", "3 Months", "Yearly"},
+		subCycleChoice:  0,
+
 		menuChoices: []string{
 			"🛒 Food (Tracking, Recipes & Shopping)",
 			"💳 Subscriptions (Payments & Dates)",
@@ -120,29 +129,28 @@ func initialModel(token string) model {
 	return m
 }
 
-// initForm now takes a boolean to determine if it should pre-fill the form
 func (m *model) initForm(state sessionState, isEdit bool) {
 	m.focusIndex = 0
-	m.inputs = make([]textinput.Model, 4)
-
-	for i := range m.inputs {
-		t := textinput.New()
-		t.CharLimit = 32
-		if i == 0 {
-			t.Focus()
-			t.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
-			t.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
-		}
-		m.inputs[i] = t
-	}
 
 	if state == stateAddFood {
+		// Food uses 4 text inputs
+		m.inputs = make([]textinput.Model, 4)
+		for i := range m.inputs {
+			t := textinput.New()
+			t.CharLimit = 32
+			if i == 0 {
+				t.Focus()
+				t.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
+				t.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
+			}
+			m.inputs[i] = t
+		}
+
 		m.inputs[0].Placeholder = "Food Name (e.g., Apple)"
 		m.inputs[1].Placeholder = "Price (e.g., 2.50)"
 		m.inputs[2].Placeholder = "Current Amount (e.g., 5)"
 		m.inputs[3].Placeholder = "Auto-Renew Threshold (0 = disabled)"
 
-		// Pre-fill if editing
 		if isEdit && m.editIndex >= 0 {
 			item := m.foodItems[m.editIndex]
 			m.inputs[0].SetValue(item.Name)
@@ -152,18 +160,38 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 		}
 
 	} else if state == stateAddSub {
+		// Subs uses 3 text inputs + 1 custom radio button row
+		m.inputs = make([]textinput.Model, 3)
+		for i := range m.inputs {
+			t := textinput.New()
+			t.CharLimit = 32
+			if i == 0 {
+				t.Focus()
+				t.PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
+				t.TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
+			}
+			m.inputs[i] = t
+		}
+
 		m.inputs[0].Placeholder = "Service Name (e.g., Netflix)"
 		m.inputs[1].Placeholder = "Price (e.g., 15.99)"
 		m.inputs[2].Placeholder = "Payment Date (e.g., Apr 01, 2026)"
-		m.inputs[3].Placeholder = "Cycle (Monthly / 3 Months / Yearly)"
 
-		// Pre-fill if editing
+		m.subCycleChoice = 0 // Default to Monthly
+
 		if isEdit && m.editIndex >= 0 {
 			item := m.subItems[m.editIndex]
 			m.inputs[0].SetValue(item.Name)
 			m.inputs[1].SetValue(fmt.Sprintf("%.2f", item.Price))
 			m.inputs[2].SetValue(item.DueDate)
-			m.inputs[3].SetValue(item.Cycle)
+
+			// Match the cycle to our radio button choices
+			for i, c := range m.subCycleChoices {
+				if c == item.Cycle {
+					m.subCycleChoice = i
+					break
+				}
+			}
 		}
 	}
 }
@@ -180,16 +208,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
+		// --- FORM HANDLING ---
 		if m.state == stateAddFood || m.state == stateAddSub {
 			switch msg.String() {
 			case "esc":
 				m.goBack()
 				return m, nil
 
+			// Catch left/right specifically for the radio buttons
+			case "left", "right":
+				if m.state == stateAddSub && m.focusIndex == 3 {
+					if msg.String() == "left" && m.subCycleChoice > 0 {
+						m.subCycleChoice--
+					} else if msg.String() == "right" && m.subCycleChoice < len(m.subCycleChoices)-1 {
+						m.subCycleChoice++
+					}
+					return m, nil // Don't pass arrow keys to text input
+				}
+
 			case "tab", "shift+tab", "enter", "up", "down":
 				s := msg.String()
 
-				if s == "enter" && m.focusIndex == len(m.inputs)-1 {
+				totalFields := 4 // Both forms have 4 logical fields (Inputs + Radios)
+
+				// If we hit enter on the LAST field, save the form!
+				if s == "enter" && m.focusIndex == totalFields-1 {
 					m.saveForm()
 					m.goBack()
 					return m, nil
@@ -197,27 +240,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				if s == "up" || s == "shift+tab" {
 					m.focusIndex--
-				} else {
+				} else if s == "down" || s == "tab" || s == "enter" {
 					m.focusIndex++
 				}
 
-				if m.focusIndex > len(m.inputs)-1 {
+				// Wrap around
+				if m.focusIndex > totalFields-1 {
 					m.focusIndex = 0
 				} else if m.focusIndex < 0 {
-					m.focusIndex = len(m.inputs) - 1
+					m.focusIndex = totalFields - 1
 				}
 
+				// Apply focus styles visually
 				cmds := make([]tea.Cmd, len(m.inputs))
-				for i := 0; i <= len(m.inputs)-1; i++ {
+				for i := 0; i < len(m.inputs); i++ {
 					if i == m.focusIndex {
 						cmds[i] = m.inputs[i].Focus()
 						m.inputs[i].PromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
 						m.inputs[i].TextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
-						continue
+					} else {
+						m.inputs[i].Blur()
+						m.inputs[i].PromptStyle = lipgloss.NewStyle()
+						m.inputs[i].TextStyle = lipgloss.NewStyle()
 					}
-					m.inputs[i].Blur()
-					m.inputs[i].PromptStyle = lipgloss.NewStyle()
-					m.inputs[i].TextStyle = lipgloss.NewStyle()
 				}
 				return m, tea.Batch(cmds...)
 			}
@@ -226,6 +271,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// --- NORMAL NAVIGATION ---
 		switch msg.String() {
 		case "q":
 			return m, tea.Quit
@@ -266,7 +312,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "a": // Add
 			if m.state == stateFood {
 				m.state = stateAddFood
-				m.editIndex = -1 // -1 means we are creating a new item
+				m.editIndex = -1
 				m.initForm(stateAddFood, false)
 			} else if m.state == stateSubs {
 				m.state = stateAddSub
@@ -277,7 +323,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "e": // Edit
 			if m.state == stateFood && len(m.foodItems) > 0 {
 				m.state = stateAddFood
-				m.editIndex = m.cursor // Save the index we want to overwrite
+				m.editIndex = m.cursor
 				m.initForm(stateAddFood, true)
 			} else if m.state == stateSubs && len(m.subItems) > 0 {
 				m.state = stateAddSub
@@ -348,9 +394,8 @@ func (m *model) saveForm() {
 
 		newItem := FoodItem{Name: name, Price: price, Amount: amount, RenewThreshold: thresh, Selected: false}
 
-		// If editing, overwrite the item. Otherwise, append.
 		if m.editIndex >= 0 {
-			newItem.Selected = m.foodItems[m.editIndex].Selected // Preserve checkbox state
+			newItem.Selected = m.foodItems[m.editIndex].Selected
 			m.foodItems[m.editIndex] = newItem
 		} else {
 			m.foodItems = append(m.foodItems, newItem)
@@ -362,10 +407,9 @@ func (m *model) saveForm() {
 		if date == "" {
 			date = "TBD"
 		}
-		cycle := m.inputs[3].Value()
-		if cycle == "" {
-			cycle = "Monthly"
-		}
+
+		// Pull the value from our radio button state instead of a text input!
+		cycle := m.subCycleChoices[m.subCycleChoice]
 
 		newItem := SubItem{Name: name, Price: price, DueDate: date, Cycle: cycle}
 
@@ -403,20 +447,36 @@ func (m model) View() string {
 	var s string
 
 	if m.state == stateAddFood || m.state == stateAddSub {
-		// Change the title dynamically based on if we are adding or editing
 		if m.editIndex >= 0 {
 			s += titleStyle.Render("✏️ EDIT ITEM") + "\n\n"
 		} else {
 			s += titleStyle.Render("➕ ADD NEW ITEM") + "\n\n"
 		}
 
+		// Render normal text inputs
 		for i := range m.inputs {
-			s += m.inputs[i].View()
-			if i < len(m.inputs)-1 {
-				s += "\n"
-			}
+			s += m.inputs[i].View() + "\n"
 		}
-		s += "\n\n" + hintStyle.Render("[Tab/Up/Down: Next Field • Enter: Save • Esc: Cancel]")
+
+		// Render custom Radio Buttons if we are in Subscriptions
+		if m.state == stateAddSub {
+			radioPrompt := "  Cycle:"
+			if m.focusIndex == 3 {
+				radioPrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render("> Cycle:")
+			}
+
+			s += radioPrompt + "\n  "
+			for i, choice := range m.subCycleChoices {
+				marker := "( )"
+				if m.subCycleChoice == i {
+					marker = checkStyle.Render("(x)")
+				}
+				s += fmt.Sprintf("%s %s   ", marker, choice)
+			}
+			s += "\n"
+		}
+
+		s += "\n\n" + hintStyle.Render("[Tab/Up/Down: Next • Left/Right: Select Cycle • Enter: Save]")
 		return lipgloss.NewStyle().Margin(1, 2).Render(s)
 	}
 
