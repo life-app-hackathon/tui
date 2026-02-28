@@ -9,14 +9,14 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"time" // Added time for our loading delay
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-const baseURL = "https://backend1.study-with-me.org"
+const baseURL = "https://backend1.study-with-me.org" // Change to your actual backend URL if needed
 
 // --- APPLICATION STATES ---
 type sessionState int
@@ -26,7 +26,7 @@ const (
 	stateFood
 	stateFoodRecipe
 	stateFoodBuy
-	stateProcessingBuy // NEW: Loading state for checkout
+	stateProcessingBuy
 	stateSubs
 	stateStudy
 	stateAddFood
@@ -37,9 +37,9 @@ const (
 type FoodItem struct {
 	Name           string  `json:"name"`
 	Price          float64 `json:"price"`
-	Amount         int     `json:"amount"`
+	Amount         int     `json:"amount"` // Current Stock in Inventory
 	RenewThreshold int     `json:"renewThreshold"`
-	Selected       bool    `json:"-"`
+	CartQty        int     `json:"-"` // How many we want to BUY right now (Local state only)
 }
 
 type SubItem struct {
@@ -65,7 +65,7 @@ type CategoryResponse struct {
 type dataFetchedMsg []CategoryResponse
 type syncSuccessMsg struct{}
 type recipeGeneratedMsg string
-type buyCompleteMsg struct{} // NEW: Signals the purchase is done
+type buyCompleteMsg struct{}
 type errMsg struct{ err error }
 
 // --- MAIN MODEL ---
@@ -194,10 +194,9 @@ func generateRecipeCmd(ingredients []string) tea.Cmd {
 	}
 }
 
-// NEW: Command to simulate payment/processing delay
 func processBuyCmd() tea.Cmd {
 	return func() tea.Msg {
-		time.Sleep(1500 * time.Millisecond) // Wait for 1.5 seconds
+		time.Sleep(1500 * time.Millisecond) // Simulate payment gateway delay
 		return buyCompleteMsg{}
 	}
 }
@@ -219,8 +218,8 @@ func (m *model) initForm(state sessionState, isEdit bool) {
 			m.inputs[i] = t
 		}
 		m.inputs[0].Placeholder = "Food Name"
-		m.inputs[1].Placeholder = "Price"
-		m.inputs[2].Placeholder = "Amount"
+		m.inputs[1].Placeholder = "Price per unit"
+		m.inputs[2].Placeholder = "Current Stock Amount"
 		m.inputs[3].Placeholder = "Auto-Renew Threshold (0 = disabled)"
 
 		if isEdit && m.editIndex >= 0 {
@@ -289,7 +288,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case syncSuccessMsg:
-		m.statusMsg = "Saved securely to database ✓"
+		// If we successfully synced, clear the status so it doesn't linger forever
+		// unless we specifically set it to something else (like after a purchase).
+		if m.statusMsg == "Syncing..." || m.statusMsg == "Syncing deletion..." {
+			m.statusMsg = "Saved securely to database ✓"
+		}
 		return m, fetchCategoriesCmd(m.token)
 
 	case recipeGeneratedMsg:
@@ -297,15 +300,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.generatedRecipe = string(msg)
 		return m, nil
 
-	// NEW: Handle the completed purchase
 	case buyCompleteMsg:
+		// 1. ADD BOUGHT ITEMS TO STOCK AND RESET CART
 		for i := range m.foodItems {
-			m.foodItems[i].Selected = false
+			if m.foodItems[i].CartQty > 0 {
+				m.foodItems[i].Amount += m.foodItems[i].CartQty // Increase stock!
+				m.foodItems[i].CartQty = 0                      // Reset cart
+			}
 		}
 		m.state = stateFood
 		m.cursor = 0
-		m.statusMsg = "Order placed successfully! 🚚"
-		return m, nil
+		m.statusMsg = "Order placed! Stock updated in database 🚚"
+		// 2. FIRE SYNC EVENT TO SAVE NEW STOCK LEVELS TO DATABASE
+		return m, syncCategoryCmd(m.token, "Food", m.catIDs["Food"], m.foodItems)
 
 	case errMsg:
 		m.isGenerating = false
@@ -320,9 +327,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
-		// Disable all normal inputs if we are in the loading screen
 		if m.state == stateProcessingBuy {
-			return m, nil
+			return m, nil // Block input while loading
 		}
 
 		if m.state == stateAddFood || m.state == stateAddSub {
@@ -376,6 +382,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.updateInputs(msg)
 		}
 
+		// --- MAIN APP NAVIGATION ---
 		switch msg.String() {
 		case "q":
 			return m, tea.Quit
@@ -396,7 +403,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.state == stateSubs {
 				limit = len(m.subItems) - 1
 			}
-			if m.state == stateFoodBuy { // Fixed limits for the checkout screen
+			if m.state == stateFoodBuy {
 				limit = len(m.buyChoices) - 1
 			}
 			if m.cursor < limit {
@@ -445,9 +452,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, syncCategoryCmd(m.token, "Subscriptions", m.catIDs["Subscriptions"], m.subItems)
 			}
 
-		case " ":
+		// ADD TO CART / REDUCE FROM CART
+		case "right", "+":
 			if m.state == stateFood && len(m.foodItems) > 0 {
-				m.foodItems[m.cursor].Selected = !m.foodItems[m.cursor].Selected
+				m.foodItems[m.cursor].CartQty++ // Increase amount we want to buy
+			}
+		case "left", "-":
+			if m.state == stateFood && len(m.foodItems) > 0 {
+				if m.foodItems[m.cursor].CartQty > 0 {
+					m.foodItems[m.cursor].CartQty-- // Decrease amount we want to buy
+				}
+			}
+		case " ":
+			// Space acts as a toggle: If 0, buy 1. If >0, reset to 0.
+			if m.state == stateFood && len(m.foodItems) > 0 {
+				if m.foodItems[m.cursor].CartQty == 0 {
+					m.foodItems[m.cursor].CartQty = 1
+				} else {
+					m.foodItems[m.cursor].CartQty = 0
+				}
 			}
 
 		case "r":
@@ -458,7 +481,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				var ingredients []string
 				for _, item := range m.foodItems {
-					if item.Selected {
+					// We use CartQty to select ingredients for recipes now
+					if item.CartQty > 0 {
 						ingredients = append(ingredients, item.Name)
 					}
 				}
@@ -482,7 +506,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.cursor = 0
 			} else if m.state == stateFoodBuy {
-				// NEW: Go into the loading state instead of instantly finishing
 				m.state = stateProcessingBuy
 				return m, processBuyCmd()
 			}
@@ -508,15 +531,15 @@ func (m *model) saveForm() tea.Cmd {
 
 	if m.state == stateAddFood {
 		price, _ := strconv.ParseFloat(m.inputs[1].Value(), 64)
-		amount, _ := strconv.Atoi(m.inputs[2].Value())
-		if amount == 0 {
-			amount = 1
+		amount, _ := strconv.Atoi(m.inputs[2].Value()) // User sets the stock manually
+		if amount < 0 {
+			amount = 0
 		}
 		thresh, _ := strconv.Atoi(m.inputs[3].Value())
 
-		newItem := FoodItem{Name: name, Price: price, Amount: amount, RenewThreshold: thresh, Selected: false}
+		newItem := FoodItem{Name: name, Price: price, Amount: amount, RenewThreshold: thresh, CartQty: 0}
 		if m.editIndex >= 0 {
-			newItem.Selected = m.foodItems[m.editIndex].Selected
+			newItem.CartQty = m.foodItems[m.editIndex].CartQty // Preserve existing cart choice
 			m.foodItems[m.editIndex] = newItem
 		} else {
 			m.foodItems = append(m.foodItems, newItem)
@@ -604,7 +627,7 @@ func (m model) View() string {
 		s += "\n" + hintStyle.Render("[up/down: Navigate • Enter: Select • q: Quit]")
 
 	case stateFood:
-		s += titleStyle.Render("🛒 FOOD - Inventory") + "\n"
+		s += titleStyle.Render("🛒 FOOD - Inventory & Cart") + "\n"
 		if len(m.foodItems) == 0 {
 			s += "    No items. Press 'a' to add one.\n"
 		} else {
@@ -613,16 +636,24 @@ func (m model) View() string {
 				if m.cursor == i {
 					cursor = "▶ "
 				}
-				check := "[ ]"
-				if item.Selected {
-					check = checkStyle.Render("[x]")
+
+				// Render Cart Qty instead of checkmark
+				cartIndicator := "[ ]"
+				if item.CartQty > 0 {
+					// We format it to 2 spaces to keep alignment clean e.g. [ 1] or [12]
+					cartIndicator = checkStyle.Render(fmt.Sprintf("[%2d]", item.CartQty))
+				} else {
+					cartIndicator = "[  ]" // 2 spaces for alignment
 				}
+
 				nameCol := lipgloss.NewStyle().Width(18).Render(item.Name)
 				renewTag := "       "
 				if item.RenewThreshold > 0 {
 					renewTag = lipgloss.NewStyle().Width(7).Render(lipgloss.NewStyle().Foreground(lipgloss.Color("#E1B12C")).Render(fmt.Sprintf("[R≤%d]", item.RenewThreshold)))
 				}
-				line := fmt.Sprintf("  %s %s %s (x%d) %s -  $%.2f", cursor, check, nameCol, item.Amount, renewTag, item.Price)
+
+				// Show both Stock (Amount) and Price
+				line := fmt.Sprintf("  %s %s %s (Stock: %2d) %s -  $%.2f", cursor, cartIndicator, nameCol, item.Amount, renewTag, item.Price)
 				if m.cursor == i {
 					s += selStyle.Render(line) + "\n"
 				} else {
@@ -630,7 +661,7 @@ func (m model) View() string {
 				}
 			}
 		}
-		s += "\n" + hintStyle.Render("[a: Add • e: Edit • d: Delete • Space: Select • r: Recipe • c: Checkout • Esc: Back]")
+		s += "\n" + hintStyle.Render("[Left/Right: Add Qty • a: Add • e: Edit • d: Del • r: Recipe • c: Checkout]")
 		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(m.statusMsg)
 
 	case stateFoodRecipe:
@@ -648,16 +679,21 @@ func (m model) View() string {
 		s += titleStyle.Render("🚚 CHECKOUT") + "\n"
 		var total float64
 		var count int
+		var cartSummary string
+
 		for _, item := range m.foodItems {
-			if item.Selected {
-				total += item.Price * float64(item.Amount)
+			if item.CartQty > 0 {
+				cost := item.Price * float64(item.CartQty)
+				total += cost
 				count++
+				cartSummary += fmt.Sprintf("  %dx %-15s - $%.2f\n", item.CartQty, item.Name, cost)
 			}
 		}
+
 		if count == 0 {
-			s += boxStyle.Render("🛒 Cart empty.")
+			s += boxStyle.Render("🛒 Cart empty.\nGo back and press Right Arrow to add items to cart.")
 		} else {
-			s += fmt.Sprintf("Selected: %d\nSubtotal: $%.2f\n\nChoose delivery:\n\n", count, total)
+			s += fmt.Sprintf("Items in Cart:\n%s\nSubtotal: $%.2f\n\nChoose delivery:\n\n", cartSummary, total)
 			for i, choice := range m.buyChoices {
 				cursor := "  "
 				if m.cursor == i {
@@ -678,7 +714,6 @@ func (m model) View() string {
 		}
 		s += "\n" + hintStyle.Render("[Enter: Buy • Esc: Cancel]")
 
-	// NEW: The loading screen that shows after you press Enter to buy
 	case stateProcessingBuy:
 		s += titleStyle.Render("🚚 PROCESSING ORDER") + "\n\n"
 		s += lipgloss.NewStyle().Foreground(lipgloss.Color("#E1B12C")).Render("⏳ Please wait, securely placing your order and processing payment...")
