@@ -112,6 +112,24 @@ type OllamaResponse struct {
 	Message OllamaMessage `json:"message"`
 }
 
+// Helper to calculate days until a deadline
+func daysUntil(dateStr string) int {
+	if dateStr == "TBD" {
+		return 999 // Ignore TBD items
+	}
+	layout := "Jan 02, 2006"
+	t, err := time.ParseInLocation(layout, dateStr, time.Local)
+	if err != nil {
+		return 999
+	}
+
+	now := time.Now()
+	// Normalize to midnight to avoid hour-truncation math issues
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+
+	return int(t.Sub(today).Hours() / 24)
+}
+
 func initialModel(token string) model {
 	return model{
 		state:     stateMenu,
@@ -721,11 +739,81 @@ func (m model) View() string {
 	}
 
 	switch m.state {
+
 	case stateMenu:
-		s += titleStyle.Render("⚡ PERSONAL DASHBOARD") + "\n"
-		s += lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(fmt.Sprintf("🔑 Auth: %s | %s", m.token, m.statusMsg)) + "\n\n"
-		s += renderList(m.menuChoices, m.cursor)
-		s += "\n" + hintStyle.Render("[up/down: Navigate • Enter: Select • q: Quit]")
+		// --- LEFT COLUMN: The Menu ---
+		menuStr := titleStyle.Render("⚡ PERSONAL DASHBOARD") + "\n"
+		menuStr += lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(fmt.Sprintf("🔑 Auth: %s", m.token)) + "\n"
+		menuStr += lipgloss.NewStyle().Foreground(lipgloss.Color("#767676")).Render(m.statusMsg) + "\n\n"
+		menuStr += renderList(m.menuChoices, m.cursor)
+		menuStr += "\n" + hintStyle.Render("[up/down: Navigate • Enter: Select • q: Quit]")
+
+		menuBox := lipgloss.NewStyle().Width(50).PaddingRight(4).Render(menuStr)
+
+		// --- RIGHT COLUMN: The Morning Briefing ---
+
+		// 1. Create a margin-free title style so it doesn't break the box border!
+		alertTitleStyle := lipgloss.NewStyle().Padding(0, 1).Foreground(lipgloss.Color("#FFF")).Background(lipgloss.Color("#7D56F4")).Bold(true)
+
+		var alertLines []string
+		alertLines = append(alertLines, alertTitleStyle.Render("⚠️ ACTION REQUIRED"))
+		alertLines = append(alertLines, " ") // Use a space instead of an empty string for safety
+
+		alertsCount := 0
+
+		// Check Low Stock Food
+		for _, f := range m.foodItems {
+			if f.RenewThreshold > 0 && f.Amount <= f.RenewThreshold {
+				line := fmt.Sprintf("🛒 LOW STOCK: %s (Only %d left)", f.Name, f.Amount)
+				alertLines = append(alertLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#E1B12C")).Render(line))
+				alertsCount++
+			}
+		}
+
+		// Check Upcoming Subscriptions
+		for _, s := range m.subItems {
+			d := daysUntil(s.DueDate)
+			if d >= 0 && d <= 3 {
+				dueText := fmt.Sprintf("in %d days", d)
+				if d == 0 {
+					dueText = "TODAY"
+				}
+				line := fmt.Sprintf("💳 RENEWAL: %s %s ($%.2f)", s.Name, dueText, s.Price)
+				alertLines = append(alertLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#EE6FF8")).Render(line))
+				alertsCount++
+			}
+		}
+
+		// Check Urgent Academics
+		for _, a := range m.studyItems {
+			d := daysUntil(a.DueDate)
+			if d >= 0 && d <= 3 {
+				cleanName := strings.ReplaceAll(a.Name, "🔴 ", "")
+				cleanName = strings.ReplaceAll(cleanName, "🟡 ", "")
+				cleanName = strings.ReplaceAll(cleanName, "🟢 ", "")
+
+				dueText := fmt.Sprintf("in %d days", d)
+				if d == 0 {
+					dueText = "TODAY"
+				}
+				line := fmt.Sprintf("📚 DUE: %s %s", cleanName, dueText)
+				alertLines = append(alertLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#FF4C4C")).Render(line))
+				alertsCount++
+			}
+		}
+
+		if alertsCount == 0 {
+			alertLines = append(alertLines, lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render("✅ All caught up! No urgent tasks."))
+		}
+
+		// 2. Join the lines together and explicitly wrap them in a container
+		//    before applying the box border. This guarantees a perfect rectangle!
+		alertContent := lipgloss.JoinVertical(lipgloss.Left, alertLines...)
+		contentContainer := lipgloss.NewStyle().Width(50).Render(alertContent)
+		alertBox := boxStyle.Copy().Render(contentContainer)
+
+		// --- JOIN THEM TOGETHER ---
+		s += lipgloss.JoinHorizontal(lipgloss.Top, menuBox, alertBox)
 
 	case stateFood:
 		s += titleStyle.Render("🛒 FOOD - Inventory & Cart") + "\n"
