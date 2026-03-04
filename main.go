@@ -18,7 +18,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-const baseURL = "https://backend1.study-with-me.org" // Change to your actual backend URL if needed
+const baseURL = "http://localhost:8080" // Change to your actual backend URL if needed
 
 // --- APPLICATION STATES ---
 type sessionState int
@@ -110,6 +110,68 @@ type OllamaRequest struct {
 
 type OllamaResponse struct {
 	Message OllamaMessage `json:"message"`
+}
+
+// --- NEW: PUSH NOTIFICATION COMMAND ---
+type pushNotificationMsg struct{}
+
+func pushGroceryListCmd(token string, items []FoodItem) tea.Cmd {
+	return func() tea.Msg {
+		var list []string
+		var total float64
+
+		// 1. Check if the user has items in their cart
+		for _, item := range items {
+			if item.CartQty > 0 {
+				cost := item.Price * float64(item.CartQty)
+				list = append(list, fmt.Sprintf("- %dx %s ($%.2f)", item.CartQty, item.Name, cost))
+				total += cost
+			}
+		}
+
+		title := "🛒 Grocery List"
+
+		// 2. If the cart is empty, send the Low Stock items instead!
+		if len(list) == 0 {
+			title = "⚠️ Low Stock Reminder"
+			for _, item := range items {
+				if item.RenewThreshold > 0 && item.Amount <= item.RenewThreshold {
+					list = append(list, fmt.Sprintf("- %s (Only %d left)", item.Name, item.Amount))
+				}
+			}
+		}
+
+		// 3. If everything is fine, return an error message
+		if len(list) == 0 {
+			return errMsg{fmt.Errorf("Nothing to push! Cart is empty and stock is fine.")}
+		}
+
+		if total > 0 {
+			list = append(list, fmt.Sprintf("\nEstimated Total: $%.2f", total))
+		}
+
+		message := title + "\n\n" + strings.Join(list, "\n")
+
+		// Use the EXACT same topic as your backend cron jobs so they all go to the same place!
+
+		req, err := http.NewRequest("POST", "https://ntfy.sh/hackaton", strings.NewReader(message))
+		if err != nil {
+			return errMsg{err}
+		}
+
+		// Add some nice formatting for the phone notification
+		req.Header.Set("Title", "Dashboard Alert")
+		req.Header.Set("Tags", "shopping_bags,iphone")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != 200 {
+			return errMsg{fmt.Errorf("Failed to send notification to phone")}
+		}
+		defer resp.Body.Close()
+
+		return pushNotificationMsg{}
+	}
 }
 
 // Helper to calculate days until a deadline
@@ -346,7 +408,7 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(textinput.Blink, fetchCategoriesCmd(m.token))
 }
 
-// --- UPDATE ---
+// Update --- UPDATE ---
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 
@@ -403,6 +465,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// we just fetch categories to grab the new Database ID!
 		return m, fetchCategoriesCmd(m.token)
 
+	case pushNotificationMsg:
+		m.statusMsg = "📲 Sent to your phone!"
+		return m, nil
+
 	case errMsg:
 		m.isGenerating = false
 		m.statusMsg = "Error: " + msg.err.Error()
@@ -423,6 +489,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.state == stateAddFood || m.state == stateAddSub {
 			switch msg.String() {
+
 			case "esc":
 				m.goBack()
 				return m, nil
@@ -570,6 +637,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else {
 					m.foodItems[m.cursor].CartQty = 0
 				}
+			}
+
+		case "p":
+			// Allow pushing from either the Inventory screen or the Checkout screen
+			if m.state == stateFood || m.state == stateFoodBuy {
+				m.statusMsg = "⏳ Sending to phone..."
+				return m, pushGroceryListCmd(m.token, m.foodItems)
 			}
 
 		case "r":
@@ -847,7 +921,7 @@ func (m model) View() string {
 				}
 			}
 		}
-		s += "\n" + hintStyle.Render("[Left/Right: Add Qty • a: Add • e: Edit • d: Del • r: Recipe • c: Checkout]")
+		s += "\n" + hintStyle.Render("[Left/Right: Add Qty • a: Add • e: Edit • d: Del • r: Recipe • c: Checkout • p: Push to Phone]")
 		s += "\n" + lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575")).Render(m.statusMsg)
 
 	case stateFoodRecipe:
